@@ -16,44 +16,44 @@
 ## Checklist
 
 ### **1. CPU (LR35902)**
-- [ ] **Opcode Coverage**  
-  - [ ] Main 8-bit ALU ops (ADD, ADC, SUB, SBC, AND, OR, XOR, CP, INC, DEC, etc.)  
-  - [ ] 16-bit ops (ADD HL, ADD SP, etc.)  
-  - [ ] Rotate/Shift ops (RLC, RRC, RL, RR, SLA, SRA, SRL, SWAP)  
-  - [ ] Bitwise ops (BIT, SET, RES)  
-  - [ ] Jumps/Calls/Returns (JP, JR, CALL, RET, RETI, etc.)  
-  - [ ] Special instructions (DAA, CPL, CCF, SCF, etc.)  
-  - [ ] CB-prefix table (extended instructions)  
-- [ ] **Instruction Timing** (correct cycle counts)  
-- [ ] **Flag Handling** (Z, N, H, C)  
-- [ ] **Interrupt Master Enable (IME) & Handling**  
-  - [ ] DI, EI instructions  
-  - [ ] Proper timing (IME set one instruction after EI)  
-- [ ] **Halt/Stop** states  
-- [ ] **PC, SP, Register Startup Values**  
+- [X] **Opcode Coverage**  
+  - [X] Main 8-bit ALU ops (ADD, ADC, SUB, SBC, AND, OR, XOR, CP, INC, DEC, etc.)  
+  - [X] 16-bit ops (ADD HL, ADD SP, etc.)  
+  - [X] Rotate/Shift ops (RLC, RRC, RL, RR, SLA, SRA, SRL, SWAP)  
+  - [X] Bitwise ops (BIT, SET, RES)  
+  - [X] Jumps/Calls/Returns (JP, JR, CALL, RET, RETI, etc.)  
+  - [X] Special instructions (DAA, CPL, CCF, SCF, etc.)  
+  - [X] CB-prefix table (extended instructions)  
+- [X] **Instruction Timing** (correct cycle counts)  
+- [X] **Flag Handling** (Z, N, H, C)  
+- [X] **Interrupt Master Enable (IME) & Handling**  
+  - [X] DI, EI instructions  
+  - [X] Proper timing (IME set one instruction after EI)  
+- [X] **Halt/Stop** states  
+- [X] **PC, SP, Register Startup Values**  
 - [ ] **Boot ROM Support** (Optional)
 
 ### **2. Memory / Bus**
-- [ ] **Cartridge Integration** (MBC0, MBC1, MBC2 and more)  
-- [ ] **VRAM (0x8000–0x9FFF)**  
-- [ ] **WRAM (0xC000–0xDFFF) & Echo (0xE000–0xFDFF)**  
-- [ ] **OAM (0xFE00–0xFE9F)**  
-- [ ] **I/O Registers (0xFF00–0xFF7F)**  
-- [ ] **HRAM (0xFF80–0xFFFE)**  
-- [ ] **Interrupt Enable (0xFFFF)**  
+- [X] **Cartridge Integration** (MBC0, MBC1, MBC2 and more)  
+- [X] **VRAM (0x8000–0x9FFF)**  
+- [X] **WRAM (0xC000–0xDFFF) & Echo (0xE000–0xFDFF)**  
+- [X] **OAM (0xFE00–0xFE9F)**  
+- [X] **I/O Registers (0xFF00–0xFF7F)**  
+- [X] **HRAM (0xFF80–0xFFFE)**  
+- [X] **Interrupt Enable (0xFFFF)**  
 
 ### **3. Timers**
-- [ ] **DIV Register**
-- [ ] **TIMA/TMA/TAC**
-- [ ] **Timer frequencies** (4096, 262144, 65536, 16384 Hz)
-- [ ] **Exact timing edge cases**
+- [X] **DIV Register**
+- [X] **TIMA/TMA/TAC**
+- [X] **Timer frequencies** (4096, 262144, 65536, 16384 Hz)
+- [X] **Exact timing edge cases**
 
 ### **4. Interrupts**
-- [ ] **IF (0xFF0F) & IE (0xFFFF)**  
-- [ ] **Priority** (VBlank, LCD STAT, Timer, Serial, Joypad)  
-- [ ] **Interrupt Vectors** (0x40, 0x48, 0x50, 0x58, 0x60)  
-- [ ] **Push PC on stack, jump to vector, IME disable**
-- [ ] **Interrupt delays / real hardware quirks** (e.g., EI sets IME after 1 instruction)
+- [X] **IF (0xFF0F) & IE (0xFFFF)**  
+- [X] **Priority** (VBlank, LCD STAT, Timer, Serial, Joypad)  
+- [X] **Interrupt Vectors** (0x40, 0x48, 0x50, 0x58, 0x60)  
+- [X] **Push PC on stack, jump to vector, IME disable**
+- [X] **Interrupt delays / real hardware quirks** (e.g., EI sets IME after 1 instruction)
 
 ### **5. PPU (Graphics)**
 - [ ] **LCD Control (LCDC)**  
@@ -77,14 +77,14 @@
 - [ ] **Rodio Integration** (stream samples in real-time)
 
 ### **7. Joypad / Input**
-- [ ] **Button states** in `Joypad` struct  
-- [ ] **P1 Register** (0xFF00) bits for direction/buttons  
-- [ ] **Interrupt on button press** (bit 4 in IF)  
-- [ ] **Minifb Key Mapping** to D-pad, A/B, Start, Select
+- [X] **Button states** in `Joypad` struct  
+- [X] **P1 Register** (0xFF00) bits for direction/buttons  
+- [X] **Interrupt on button press** (bit 4 in IF)  
+- [X] **Minifb Key Mapping** to D-pad, A/B, Start, Select
 
 ### **8. DMA**
-- [ ] **OAM DMA**
-- [ ] **Timing** 
+- [X] **OAM DMA**
+- [X] **Timing** 
 - [ ] **HDMA (on CGB)** if implementing Game Boy Color features
 
 ### **9. Boot**
@@ -97,7 +97,7 @@
 - [ ] **Interrupt** on serial completion
 
 ### **11. Extended Cartridge Types** (Optional)
-- [ ] **MBC5, MBC3 (with RTC), MBC4**, etc.  
+- [X] **MBC5, MBC3 (with RTC), MBC4**, etc.  
 - [ ] **Battery-backed saves** (persist `cart_ram` to disk)  
 
 ### **12. Game Boy Color (CGB)** (Optional)
