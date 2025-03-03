@@ -34,7 +34,7 @@
 - [ ] **Boot ROM Support** (Optional)
 
 ### **2. Memory / Bus**
-- [X] **Cartridge Integration** (MBC0, MBC1, MBC2 and more)  
+- [ ] **Cartridge Integration** (MBC0, MBC1, MBC2 and more)  
 - [X] **VRAM (0x8000–0x9FFF)**  
 - [X] **WRAM (0xC000–0xDFFF) & Echo (0xE000–0xFDFF)**  
 - [X] **OAM (0xFE00–0xFE9F)**  
@@ -56,16 +56,16 @@
 - [X] **Interrupt delays / real hardware quirks** (e.g., EI sets IME after 1 instruction)
 
 ### **5. PPU (Graphics)**
-- [ ] **LCD Control (LCDC)**  
-- [ ] **LCD Status (STAT)** with modes (OAM scan, VRAM read, HBlank, VBlank)  
-- [ ] **Scanline Timing** (each line ~456 cycles, 144 visible lines, etc.)  
-- [ ] **Tile & Background Rendering**  
-  - [ ] BG tile map / tile data addressing  
-  - [ ] Window rendering  
-  - [ ] Sprite rendering (OAM) / Priority / Overlap rules  
-  - [ ] Palettes (BGP, OBP0, OBP1)  
-- [ ] **VBlank interrupt**  
-- [ ] **LCD STAT interrupt**
+- [X] **LCD Control (LCDC)**  
+- [X] **LCD Status (STAT)** with modes (OAM scan, VRAM read, HBlank, VBlank)  
+- [X] **Scanline Timing** (each line ~456 cycles, 144 visible lines, etc.)  
+- [X] **Tile & Background Rendering**  
+  - [X] BG tile map / tile data addressing  
+  - [X] Window rendering  
+  - [X] Sprite rendering (OAM) / Priority / Overlap rules  
+  - [X] Palettes (BGP, OBP0, OBP1)  
+- [X] **VBlank interrupt**  
+- [X] **LCD STAT interrupt**
 
 ### **6. APU (Audio)**
 - [ ] **Square Channel 1** (Sweep, Envelope, Length)  
@@ -97,7 +97,7 @@
 - [ ] **Interrupt** on serial completion
 
 ### **11. Extended Cartridge Types** (Optional)
-- [X] **MBC5, MBC3 (with RTC), MBC4**, etc.  
+- [ ] **MBC5, MBC3 (with RTC), MBC4**, etc.  
 - [ ] **Battery-backed saves** (persist `cart_ram` to disk)  
 
 ### **12. Game Boy Color (CGB)** (Optional)
@@ -110,7 +110,7 @@
 ### **13. Performance & Compatibility**
 - [ ] **Cycle-Accurate Timing** for CPU, PPU, APU if aiming for high accuracy  
 - [ ] **Speed** (60 FPS target) with no audio cracks or frame drops  
-- [ ] **Pass basic test ROMs** (e.g., Blargg’s CPU tests, Mooneye-GB tests)  
+- [X] **Pass basic test ROMs** (e.g., Blargg’s CPU tests, Mooneye-GB tests)  
 - [ ] **Save States** (serialize CPU/PPU/APU states)
 
 ---
