@@ -80,7 +80,7 @@
 - [X] **Button states** in `Joypad` struct  
 - [X] **P1 Register** (0xFF00) bits for direction/buttons  
 - [X] **Interrupt on button press** (bit 4 in IF)  
-- [X] **Minifb Key Mapping** to D-pad, A/B, Start, Select
+- [X] **Key Mappings** to D-pad, A/B, Start, Select
 
 ### **8. DMA**
 - [X] **OAM DMA**
