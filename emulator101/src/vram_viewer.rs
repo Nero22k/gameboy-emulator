@@ -1,11 +1,10 @@
-use crate::ppu::Ppu;
+use crate::ppu::{Ppu, SCREEN_WIDTH, SCREEN_HEIGHT};
 use sdl2::event::Event;
 use sdl2::keyboard::Keycode;
 use sdl2::pixels::{Color, PixelFormatEnum};
 use sdl2::rect::Rect;
 use sdl2::render::{Canvas, Texture, TextureCreator};
 use sdl2::video::{Window, WindowContext};
-use std::time::Duration;
 
 // Constants for viewer layout
 const TILE_WIDTH: u32 = 8;
@@ -83,9 +82,9 @@ impl VramViewer {
     pub fn toggle(&mut self) {
         self.is_open = !self.is_open;
         if self.is_open {
-            self.canvas.window_mut().show();
+            self.canvas.window_mut().show(); // Show the window
         } else {
-            self.canvas.window_mut().hide();
+            self.canvas.window_mut().hide(); // Hide the window
         }
     }
     
@@ -278,19 +277,35 @@ impl VramViewer {
                               sidebar_x + 10, checkbox_y, Color::RGB(0, 0, 0))?;
                 
                 checkbox_y += 20;
-                self.draw_text(&format!("SCY: {}", ppu.scy), 
+                self.draw_text(&format!("STAT: 0x{:02X}", ppu.stat), 
                               sidebar_x + 10, checkbox_y, Color::RGB(0, 0, 0))?;
                 
                 checkbox_y += 20;
-                self.draw_text(&format!("SCX: {}", ppu.scx), 
+                self.draw_text(&format!("SCY: 0x{:02X}", ppu.scy), 
                               sidebar_x + 10, checkbox_y, Color::RGB(0, 0, 0))?;
                 
                 checkbox_y += 20;
-                self.draw_text(&format!("WY: {}", ppu.wy), 
+                self.draw_text(&format!("SCX: 0x{:02X}", ppu.scx), 
+                              sidebar_x + 10, checkbox_y, Color::RGB(0, 0, 0))?;
+            
+                checkbox_y += 20;
+                self.draw_text(&format!("LY: 0x{:02X}", ppu.ly),
                               sidebar_x + 10, checkbox_y, Color::RGB(0, 0, 0))?;
                 
                 checkbox_y += 20;
-                self.draw_text(&format!("WX: {}", ppu.wx), 
+                self.draw_text(&format!("LYC: 0x{:02X}", ppu.lyc),
+                              sidebar_x + 10, checkbox_y, Color::RGB(0, 0, 0))?;
+                
+                checkbox_y += 20;
+                self.draw_text(&format!("DMA: 0x{:02X}", ppu.dma),
+                              sidebar_x + 10, checkbox_y, Color::RGB(0, 0, 0))?;
+                
+                checkbox_y += 20;
+                self.draw_text(&format!("WY: 0x{:02X}", ppu.wy), 
+                              sidebar_x + 10, checkbox_y, Color::RGB(0, 0, 0))?;
+                
+                checkbox_y += 20;
+                self.draw_text(&format!("WX: 0x{:02X}", ppu.wx), 
                               sidebar_x + 10, checkbox_y, Color::RGB(0, 0, 0))?;
             },
             ViewerTab::Tiles => {
@@ -340,8 +355,8 @@ impl VramViewer {
     fn render_bg_map(&mut self, ppu: &Ppu) -> Result<(), String> {
         // Create a texture to hold the entire map
         let mut texture = self.texture_creator.create_texture_streaming(
-            PixelFormatEnum::RGB24, 
-            BG_MAP_WIDTH * TILE_WIDTH, 
+            PixelFormatEnum::RGB24,
+            BG_MAP_WIDTH * TILE_WIDTH,
             BG_MAP_HEIGHT * TILE_HEIGHT
         ).unwrap();
         
@@ -350,20 +365,33 @@ impl VramViewer {
             for y in 0..BG_MAP_HEIGHT {
                 for x in 0..BG_MAP_WIDTH {
                     // Calculate map address and fetch tile index
-                    let map_addr = self.options.bg_map_offset + y as u16 * 32 as u16 + x as u16;
+                    let map_addr = self.options.bg_map_offset + y as u16 * 32 + x as u16;
                     let tile_index = ppu.read_vram(map_addr as u16);
                     
-                    // Get tile data address (adjust based on LCDC bit 4)
+                    // Get tile data address - handle both addressing modes correctly
+                    // This is crucial for proper rendering
                     let tile_data_addr = if ppu.lcdc & 0x10 != 0 {
-                        // $8000 addressing mode
+                        // $8000 addressing mode (unsigned)
                         0x8000 + (tile_index as u16) * 16
                     } else {
-                        // $8800 addressing mode
-                        0x9000 + (tile_index as u16) * 16
+                        // $8800 addressing mode (signed)
+                        // Convert to signed, then offset from $9000
+                        if tile_index < 128 {
+                            0x9000 + (tile_index as u16) * 16
+                        } else {
+                            0x8800 + ((tile_index - 128) as u16) * 16
+                        }
                     };
                     
-                    // Draw the tile
-                    self.draw_tile(buffer, pitch, tile_data_addr, x as u32 * TILE_WIDTH, y as u32 * TILE_HEIGHT, ppu);
+                    // Draw the tile at the appropriate position
+                    self.draw_tile(
+                        buffer,
+                        pitch,
+                        tile_data_addr,
+                        x as u32 * TILE_WIDTH,
+                        y as u32 * TILE_HEIGHT,
+                        ppu
+                    );
                 }
             }
         })?;
@@ -382,7 +410,7 @@ impl VramViewer {
             self.canvas.set_draw_color(Color::RGB(100, 100, 100));
             
             // Draw vertical grid lines
-            for x in 0..BG_MAP_WIDTH {
+            for x in 0..=BG_MAP_WIDTH {
                 let x_pos = (x * TILE_WIDTH * TILE_DISPLAY_SCALE) as i32;
                 self.canvas.draw_line(
                     (x_pos, 30), 
@@ -391,7 +419,7 @@ impl VramViewer {
             }
             
             // Draw horizontal grid lines
-            for y in 0..BG_MAP_HEIGHT {
+            for y in 0..=BG_MAP_HEIGHT {
                 let y_pos = 30 + (y * TILE_HEIGHT * TILE_DISPLAY_SCALE) as i32;
                 self.canvas.draw_line(
                     (0, y_pos), 
@@ -399,7 +427,34 @@ impl VramViewer {
                 )?;
             }
         }
-
+        
+        // If window visible, draw a highlight around the visible portion
+        /*if ppu.lcdc & 0x20 != 0 && ppu.wy < 144 && ppu.wx <= 166 {
+            // Calculate visible window region
+            let window_left = ppu.wx.saturating_sub(7) as i32;
+            let window_top = ppu.wy as i32;
+            
+            // Highlight visible window region
+            self.canvas.set_draw_color(Color::RGB(0, 0, 255));
+            let highlight_rect = Rect::new(
+                window_left * TILE_DISPLAY_SCALE as i32,
+                30 + window_top * TILE_DISPLAY_SCALE as i32,
+                (SCREEN_WIDTH as i32 - window_left) as u32 * TILE_DISPLAY_SCALE / 8,
+                (SCREEN_HEIGHT as i32 - window_top) as u32 * TILE_DISPLAY_SCALE / 8
+            );
+            self.canvas.draw_rect(highlight_rect)?;
+        }*/
+        
+        // Also highlight visible screen area
+        self.canvas.set_draw_color(Color::RGB(255, 0, 0));
+        let visible_rect = Rect::new(
+            ppu.scx as i32 * TILE_DISPLAY_SCALE as i32,
+            30 + (ppu.scy as i32 * TILE_DISPLAY_SCALE as i32),
+            SCREEN_WIDTH as u32 * TILE_DISPLAY_SCALE,
+            SCREEN_HEIGHT as u32 * TILE_DISPLAY_SCALE
+        );
+        self.canvas.draw_rect(visible_rect)?;
+        
         Ok(())
     }
     
@@ -562,13 +617,13 @@ impl VramViewer {
         let start_y = 50;
         
         // Draw BGP
-        self.draw_dmg_palette(ppu.bgp, "BGP", 20, start_y, palette_width, palette_height)?;
+        self.draw_dmg_palette(ppu.bgp, "BGP", 50, start_y, palette_width, palette_height)?;
         
         // Draw OBP0
-        self.draw_dmg_palette(ppu.obp0, "OBP0", 20, start_y + palette_spacing, palette_width, palette_height)?;
+        self.draw_dmg_palette(ppu.obp0, "OBP0", 50, start_y + palette_spacing, palette_width, palette_height)?;
         
         // Draw OBP1
-        self.draw_dmg_palette(ppu.obp1, "OBP1", 20, start_y + 2 * palette_spacing, palette_width, palette_height)?;
+        self.draw_dmg_palette(ppu.obp1, "OBP1", 50, start_y + 2 * palette_spacing, palette_width, palette_height)?;
         
         Ok(())
     }
@@ -596,6 +651,7 @@ impl VramViewer {
         }
         
         // TODO: Add text rendering for palette name
+        self.draw_text(name, 10, y + 5, Color::RGB(0, 0, 0))?;
         
         Ok(())
     }
@@ -613,38 +669,87 @@ impl VramViewer {
     }
     
     fn draw_tile(&self, buffer: &mut [u8], pitch: usize, tile_addr: u16, x: u32, y: u32, ppu: &Ppu) {
-        // Draw an 8x8 tile to the buffer
+        // Ensure we're within the bounds of VRAM
+        if tile_addr < 0x8000 || tile_addr >= 0x9800 {
+            // Invalid tile address, fill with a red pattern to indicate an error
+            for row in 0..8 {
+                for col in 0..8 {
+                    let pixel_x = x + col;
+                    let pixel_y = y + row;
+                    let offset = (pixel_y as usize * pitch) + (pixel_x as usize * 3);
+                    
+                    if offset + 2 < buffer.len() {
+                        if (row + col) % 2 == 0 {
+                            buffer[offset] = 255;     // R
+                            buffer[offset + 1] = 0;   // G
+                            buffer[offset + 2] = 0;   // B
+                        } else {
+                            buffer[offset] = 100;     // R
+                            buffer[offset + 1] = 0;   // G
+                            buffer[offset + 2] = 0;   // B
+                        }
+                    }
+                }
+            }
+            return;
+        }
+        
+        // Draw the 8x8 tile
         for row in 0..8 {
-            let addr = tile_addr + (row * 2) as u16;
-            let low_byte = ppu.read_vram(addr);
-            let high_byte = ppu.read_vram(addr + 1);
+            // Get the two bytes that define this row of the tile
+            let low_byte = ppu.read_vram(tile_addr + (row * 2) as u16);
+            let high_byte = ppu.read_vram(tile_addr + (row * 2 + 1) as u16);
             
+            // Render all 8 pixels in this row
             for col in 0..8 {
-                let bit_pos = 7 - col;
-                let low_bit = (low_byte >> bit_pos) & 0x01;
-                let high_bit = (high_byte >> bit_pos) & 0x01;
+                // For each pixel, combine bits from both data bytes
+                // The bits are in MSB order (leftmost pixel is highest bit)
+                let bit_position = 7 - col;
+                let low_bit = (low_byte >> bit_position) & 0x01;
+                let high_bit = (high_byte >> bit_position) & 0x01;
                 let color_idx = (high_bit << 1) | low_bit;
                 
-                // Get the palette color
-                let palette_color = (ppu.bgp >> (color_idx * 2)) & 0x03;
+                // Apply palette - convert color index (0-3) to actual gray shade
+                let gb_color = (ppu.bgp >> (color_idx * 2)) & 0x03;
                 
-                // Draw the pixel if it's within the buffer boundaries
+                // Calculate position in the buffer
                 let pixel_x = x + col;
                 let pixel_y = y + row;
                 let offset = (pixel_y as usize * pitch) + (pixel_x as usize * 3);
                 
+                // Only draw within buffer bounds
                 if offset + 2 < buffer.len() {
-                    let color = self.get_dmg_color(palette_color);
-                    buffer[offset] = color.r;
-                    buffer[offset + 1] = color.g;
-                    buffer[offset + 2] = color.b;
+                    // Set the pixel color in RGB format
+                    match gb_color {
+                        0 => { // Lightest (almost white)
+                            buffer[offset] = 224;
+                            buffer[offset + 1] = 248;
+                            buffer[offset + 2] = 208;
+                        },
+                        1 => { // Light green
+                            buffer[offset] = 136;
+                            buffer[offset + 1] = 192;
+                            buffer[offset + 2] = 112;
+                        },
+                        2 => { // Dark green
+                            buffer[offset] = 52;
+                            buffer[offset + 1] = 104;
+                            buffer[offset + 2] = 86;
+                        },
+                        3 => { // Darkest (almost black)
+                            buffer[offset] = 8;
+                            buffer[offset + 1] = 24;
+                            buffer[offset + 2] = 32;
+                        },
+                        _ => {} // Should never happen
+                    }
                 }
             }
         }
     }
 
     fn draw_text(&mut self, text: &str, x: i32, y: i32, color: Color) -> Result<(), String> {
-        // Simple 5x7 bitmap font implementation for Game Boy viewer
+        // Simple 5x7 bitmap font implementation for VRAM viewer
         // Each character is represented as a series of bits in a 5x7 grid
         
         // Define a simple font for the basic characters we need
@@ -732,8 +837,8 @@ impl VramViewer {
         self.canvas.set_draw_color(color);
 
         // Character dimensions
-        let char_width = 6; // 5 pixels + 1 spacing
-        let char_height = 8; // 7 pixels + 1 spacing
+        let _char_width = 6; // 5 pixels + 1 spacing
+        let _char_height = 8; // 7 pixels + 1 spacing
         
         // Draw each character
         let mut cursor_x = x;
@@ -757,7 +862,7 @@ impl VramViewer {
             }
             
             // Move cursor to next character position
-            cursor_x += char_width;
+            cursor_x += _char_width;
         }
         
         Ok(())

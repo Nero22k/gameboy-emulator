@@ -268,8 +268,8 @@ impl Cpu {
         println!("N: {}", self.f.n);
         println!("H: {}", self.f.h);
         println!("C: {}", self.f.c);
-        println!("ie: {}", memory.get_ie());
-        println!("if: {}", memory.get_if());
+        println!("ie: {:#04X}", memory.get_ie());
+        println!("if: {:#04X}", memory.get_if());
         println!("ime: {}", self.ime);
         println!("pending_ime: {}", self.pending_ime);
         println!("halted: {}", self.halted);
@@ -277,29 +277,41 @@ impl Cpu {
 
     // Execute a single instruction
     pub fn step<'a>(&mut self, memory: &mut MemoryBus<'a>) -> u8 {
+        // First, handle any pending interrupts
+        let mut total_cycles = 0;
+        
+        // Only process interrupts if IME is enabled or if HALT checking needs to happen
+        if self.ime || self.halted {
+            let interrupt_cycles = self.handle_interrupts(memory);
+            total_cycles += interrupt_cycles;
+            
+            // If we spent cycles handling an interrupt, return without executing an instruction
+            if interrupt_cycles > 0 {
+                return interrupt_cycles;
+            }
+        }
+        
         // If halted, check if we should wake up
         if self.halted {
             if InterruptController::has_pending_interrupts(memory) {
                 self.halted = false;
             } else {
                 // Stay halted for 4 T-cycles
+                self.cycle_count += 4;
                 return 4;
             }
         }
         
-        // Handle HALT bug - don't increment PC for the next instruction
+        // Execute an instruction
         let opcode = self.fetch_byte(memory);
-
+    
         if self.halt_bug {
-            //self.debugging(memory, opcode);
             self.pc = self.pc.wrapping_sub(1);
             self.halt_bug = false;
         }
         
         let cycles = self.execute_instruction(opcode, memory);
-
-        // Debugging
-        //self.debugging(memory, opcode);
+        total_cycles += cycles;
         
         // Handle EI's delayed effect
         if self.pending_ime {
@@ -307,33 +319,98 @@ impl Cpu {
             self.pending_ime = false;
         }
         
+        //self.debugging(memory, opcode);
+
         // Count cycles
-        self.cycle_count += cycles as u64;
-        cycles
+        self.cycle_count += total_cycles as u64;
+        
+        total_cycles
     }
 
     // Process pending interrupts
-    pub fn handle_interrupts<'a>(&mut self, memory: &mut MemoryBus<'a>) -> u8 {
+    /*
+       1. We check if all interrupts were disabled (in which case we cancel completely)
+       2. If only some interrupts were disabled, we check if the original highest priority interrupt was among them
+       3. If the original interrupt was disabled, we look for the next highest priority interrupt
+       4. If another interrupt is found, we proceed with that one instead
+       5. Only if no interrupts remain enabled do we cancel the entire process
+    */
+    fn handle_interrupts<'a>(&mut self, memory: &mut MemoryBus<'a>) -> u8 {
         if !self.ime {
             return 0;
         }
         
-        if let Some(interrupt) = InterruptController::get_highest_priority_interrupt(memory) {
-            // Disable IME
+        // Check if any interrupts are pending
+        if let Some(original_interrupt) = InterruptController::get_highest_priority_interrupt(memory) {
+            // Step 1: Disable IME
             self.ime = false;
-
-            let interrupt: InterruptType = interrupt;
             
-            // Clear the interrupt flag
-            memory.clear_interrupt(interrupt);
+            // Step 2: Push PC to stack (this might modify IE and change which interrupt is handled)
+            // First push high byte
+            self.sp = self.sp.wrapping_sub(1);
+            let high_byte = (self.pc >> 8) as u8;
             
-            // Push PC onto stack
-            self.push_word(memory, self.pc);
+            // Save IE and IF before the write
+            let ie_before = memory.get_ie();
+            let if_before = memory.get_if();
             
-            // Jump to interrupt vector
-            self.pc = InterruptController::get_interrupt_vector(interrupt);
+            // Write the high byte to stack
+            memory.write_byte(self.sp, high_byte);
             
-            // Return the number of cycles (interrupts take 20 T-cycles or 5 M-cycles)
+            // Check if we wrote to IE (address 0xFFFF)
+            let high_addr = self.sp;
+            if high_addr == 0xFFFF {
+                // Get new IE value after the write
+                let ie_after = memory.get_ie();
+                
+                // Calculate which interrupts were pending before and after
+                let pending_before = ie_before & if_before & 0x1F;
+                let pending_after = ie_after & if_before & 0x1F;
+                
+                if pending_after == 0 {
+                    // All interrupts were disabled - cancel and set PC to 0x0000
+                    self.pc = 0x0000;
+                    return 20;
+                }
+                
+                // Check if the original highest priority interrupt was disabled
+                let original_bit = 1 << (original_interrupt as u8);
+                if (pending_before & original_bit) != 0 && (pending_after & original_bit) == 0 {
+                    // The original interrupt was disabled, but there might be others
+                    
+                    // Check for the next highest priority interrupt
+                    if let Some(new_interrupt) = InterruptController::get_highest_priority_interrupt(memory) {
+                        // A different interrupt is now the highest priority
+                        // Continue with the lower byte push
+                        self.sp = self.sp.wrapping_sub(1);
+                        memory.write_byte(self.sp, self.pc as u8);
+                        
+                        // Clear only the new interrupt flag
+                        memory.clear_interrupt(new_interrupt);
+                        
+                        // Jump to the new interrupt vector
+                        self.pc = InterruptController::get_interrupt_vector(new_interrupt);
+                        
+                        return 20;
+                    } else {
+                        // No other interrupts are enabled - cancel
+                        self.pc = 0x0000;
+                        return 20;
+                    }
+                }
+            }
+            
+            // Push low byte
+            self.sp = self.sp.wrapping_sub(1);
+            memory.write_byte(self.sp, self.pc as u8);
+            
+            // Step 3: ONLY NOW clear the interrupt flag
+            memory.clear_interrupt(original_interrupt);
+            
+            // Step 4: Jump to interrupt vector
+            self.pc = InterruptController::get_interrupt_vector(original_interrupt);
+            
+            // Return the number of cycles
             return 20;
         }
         

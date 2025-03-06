@@ -9,6 +9,7 @@ use emulator101::cpu::Cpu;
 use emulator101::memory::MemoryBus;
 use emulator101::ppu::{SCREEN_WIDTH, SCREEN_HEIGHT};
 use emulator101::vram_viewer::VramViewer;
+use emulator101::interrupts::InterruptType;
 
 use sdl2::event::Event;
 use sdl2::keyboard::Keycode;
@@ -28,19 +29,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>>
 {
     // Get command line arguments
     let args: Vec<String> = env::args().collect();
-    if args.len() < 2 {
-        println!("Usage: emulator101 [test|run <rom_path>]");
+    if args.len() < 3 {
+        println!("Usage: emulator101 [run <rom_path>]");
         return Ok(());
     }
-
-    if args[1] == "test" {
-        run_tests();
-    } 
-    else if args[1] == "run" {
-        if args.len() < 3 {
-            println!("Usage: emulator101 run <rom_path>");
-            return Ok(());
-        }
+    
+    if args[1] == "run" {
         run_emulator(&args[2])?;
     } else {
         println!("Usage: emulator101 [test|run <rom_path>]");
@@ -116,9 +110,6 @@ fn run_emulator(rom_path: &str) -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
-
-        // Update joypad state
-        memory.update_joypad();
         
         // Run CPU cycles until a frame is ready (at 60 FPS)
         let mut cycles_this_frame = 0;
@@ -126,19 +117,31 @@ fn run_emulator(rom_path: &str) -> Result<(), Box<dyn std::error::Error>> {
             // Execute one CPU instruction
             let cycles = cpu.step(&mut memory);
             cycles_this_frame += cycles as u32;
-            
-            // Update timer with the number of cycles
-            memory.update_timer(cycles);
-            
-            // Update PPU with the number of cycles
-            memory.update_ppu(cycles);
-            
-            // Handle interrupts
-            let interrupt_cycles = cpu.handle_interrupts(&mut memory);
-            if interrupt_cycles > 0 {
-                cycles_this_frame += interrupt_cycles as u32;
-                memory.update_timer(interrupt_cycles);
-                memory.update_ppu(interrupt_cycles);
+
+            // Update components cycle-by-cycle
+            for _ in 0..cycles {
+                // Update timer
+                if memory.update_timer_cycle() {
+                    memory.request_interrupt(InterruptType::Timer);
+                }
+                
+                // Update PPU
+                if let Some(interrupt) = memory.update_ppu_cycle() {
+                    memory.request_interrupt(interrupt);
+                }
+                
+                // Update serial
+                if memory.update_serial_cycle() {
+                    memory.request_interrupt(InterruptType::Serial);
+                }
+                
+                // Update joypad
+                if memory.update_joypad_cycle() {
+                    memory.request_interrupt(InterruptType::Joypad);
+                }
+                
+                // Process DMA transfers (one byte per cycle)
+                memory.process_dma_cycle();
             }
         }
         
@@ -173,73 +176,4 @@ fn run_emulator(rom_path: &str) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
-}
-
-fn run_tests() {
-    // Run tests
-    let test_roms = vec![
-        "..\\..\\gb-test-roms-master\\cpu_instrs\\individual\\01-special.gb",
-        "..\\..\\gb-test-roms-master\\cpu_instrs\\individual\\02-interrupts.gb",
-        "..\\..\\gb-test-roms-master\\cpu_instrs\\individual\\03-op sp,hl.gb",
-        "..\\..\\gb-test-roms-master\\cpu_instrs\\individual\\04-op r,imm.gb",
-        "..\\..\\gb-test-roms-master\\cpu_instrs\\individual\\05-op rp.gb",
-        "..\\..\\gb-test-roms-master\\cpu_instrs\\individual\\06-ld r,r.gb",
-        "..\\..\\gb-test-roms-master\\cpu_instrs\\individual\\07-jr,jp,call,ret,rst.gb",
-        "..\\..\\gb-test-roms-master\\cpu_instrs\\individual\\08-misc instrs.gb",
-        "..\\..\\gb-test-roms-master\\cpu_instrs\\individual\\09-op r,r.gb",
-        "..\\..\\gb-test-roms-master\\cpu_instrs\\individual\\10-bit ops.gb",
-        "..\\..\\gb-test-roms-master\\cpu_instrs\\individual\\11-op a,(hl).gb",
-        "..\\..\\gb-test-roms-master\\instr_timing\\instr_timing.gb",
-        //"..\\..\\gb-test-roms-master\\mem_timing\\individual\\01-read_timing.gb",
-        //"..\\..\\gb-test-roms-master\\mem_timing\\individual\\02-write_timing.gb",
-        //"..\\..\\gb-test-roms-master\\mem_timing\\individual\\03-modify_timing.gb",
-        //"..\\..\\gb-test-roms-master\\halt_bug.gb", No serial output requies display LCD to see results
-    ];
-
-    let mut passed_count = 0;
-    let mut failed_count = 0;
-    let total_count = test_roms.len();
-
-    for rom in test_roms {
-        let rom_data = read_rom(rom).unwrap();
-        let mut memory = MemoryBus::new(&rom_data);
-        let mut cpu = Cpu::new();
-        cpu.reset();
-
-        println!("Running test: {}", rom);
-        println!("Listening on serial port for output");
-        while true
-        {
-            // Execute one CPU instruction
-            let cycles = cpu.step(&mut memory);
-
-            // Update timer with the number of cycles
-            memory.update_timer(cycles);
-            
-            // Handle interrupts
-            let interrupt_cycles: u8 = cpu.handle_interrupts(&mut memory);
-            if interrupt_cycles > 0
-            {
-                // In a real emulator, we'd update timers, PPU, etc. here
-                memory.update_timer(interrupt_cycles);
-            }
-
-            // Check for test output
-            if memory.serial_output.contains("Passed") {
-                passed_count += 1;
-                break;
-            } else if memory.serial_output.contains("Failed") {
-                failed_count += 1;
-                break;
-            }
-        }
-
-        // Output results
-        println!("Test finished!");
-        println!("Cycles executed: {}", cpu.cycle_count);
-        println!("Serial output: {}", memory.serial_output);
-    }
-
-    println!("-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-");
-    println!("Tests passed: {}/{}", passed_count, total_count);
 }

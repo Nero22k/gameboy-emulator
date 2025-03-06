@@ -13,75 +13,89 @@ pub struct Timer {
     // State for TIMA overflow handling
     tima_overflow: bool,
     tima_overflow_cycles: u8,
+    // Queued write during overflow state
+    queued_tima_write: Option<u8>,
 }
 
 impl Timer {
     pub fn new() -> Self {
         Self {
-            div_counter: 0xAB,
+            div_counter: 0xABCC,
             tima: 0,
             tma: 0,
             tac: 0xF8,
             previous_and_result: false,
             tima_overflow: false,
             tima_overflow_cycles: 0,
+            queued_tima_write: None,
         }
     }
-    
-    pub fn update(&mut self, cycles: u8) -> bool {
+
+    pub fn update_cycle(&mut self) -> bool {
         let mut interrupt_requested = false;
         
-        // Process each T-cycle individually for accuracy
-        for _ in 0..cycles {
-            // Increment the 16-bit DIV counter
-            self.div_counter = self.div_counter.wrapping_add(1);
-            
-            // Get the bit position to check based on TAC clock select
-            let bit_position: u8 = match self.tac & 0x03 {
-                0 => 9, // CPU Clock / 1024 (check bit 9)
-                1 => 3, // CPU Clock / 16 (check bit 3)
-                2 => 5, // CPU Clock / 64 (check bit 5)
-                3 => 7, // CPU Clock / 256 (check bit 7)
-                _ => unreachable!(),
-            };
-            
-            // Extract the bit from DIV counter at the specified position
-            let bit_value = (self.div_counter & (1 << bit_position)) != 0;
-            
-            // Check if timer is enabled
-            let timer_enabled = (self.tac & 0x04) != 0;
-            
-            // Calculate current AND result
-            let current_and_result = bit_value && timer_enabled;
-            
-            // Check for falling edge (1->0)
-            if self.previous_and_result && !current_and_result {
-                // Increment TIMA on falling edge
-                if !self.tima_overflow {
-                    let (new_tima, overflow) = self.tima.overflowing_add(1);
-                    self.tima = new_tima;
-                    
-                    if overflow {
-                        // Start TIMA overflow sequence
-                        self.tima_overflow = true;
-                        self.tima_overflow_cycles = 0;
-                    }
+        // Increment the 16-bit DIV counter
+        self.div_counter = self.div_counter.wrapping_add(1);
+        
+        // Get the bit position to check based on TAC clock select
+        let bit_position: u8 = match self.tac & 0x03 {
+            0 => 9, // 4096HZ (check bit 9)
+            1 => 3, // 262144HZ (check bit 3)
+            2 => 5, // 65536HZ (check bit 5)
+            3 => 7, // 16384HZ (check bit 7)
+            _ => unreachable!(),
+        };
+        
+        // Extract the bit from DIV counter at the specified position
+        let bit_value = (self.div_counter & (1 << bit_position)) != 0;
+        
+        // Check if timer is enabled
+        let timer_enabled = (self.tac & 0x04) != 0;
+        
+        // Calculate current AND result
+        let current_and_result = bit_value && timer_enabled;
+        
+        // Check for falling edge (1->0)
+        if self.previous_and_result && !current_and_result {
+            // Increment TIMA on falling edge
+            if !self.tima_overflow {
+                let current_tima = self.tima;
+                self.tima = self.tima.wrapping_add(1);
+                
+                // Check for overflow (when TIMA goes from 0xFF to 0x00)
+                if current_tima == 0xFF {
+                    self.tima_overflow = true;
+                    self.tima_overflow_cycles = 0;
+                    // Keep TIMA at zero during the delay period
+                    self.tima = 0;
                 }
             }
+        }
+        
+        // Update the previous AND result for next cycle
+        self.previous_and_result = current_and_result;
+        
+        // Handle TIMA overflow (if active)
+        if self.tima_overflow {
+            self.tima_overflow_cycles += 1;
             
-            // Update the previous AND result for next cycle
-            self.previous_and_result = current_and_result;
+            // TIMA reads as 0 during overflow
+            self.tima = 0;
             
-            // Handle TIMA overflow (if active)
-            if self.tima_overflow {
-                self.tima_overflow_cycles += 1;
+            if self.tima_overflow_cycles == 4 {
+                // First reload from TMA
+                self.tima = self.tma;
                 
-                if self.tima_overflow_cycles >= 4 {
-                    // After 4 cycles, reload TIMA from TMA and request interrupt
-                    self.tima = self.tma;
-                    interrupt_requested = true;
-                    self.tima_overflow = false;
+                // THEN apply any queued write
+                if let Some(value) = self.queued_tima_write {
+                    self.tima = value;
+                    self.queued_tima_write = None;
                 }
+                
+                // Reset overflow state and trigger interrupt
+                self.tima_overflow = false;
+                self.tima_overflow_cycles = 0;
+                interrupt_requested = true;
             }
         }
         
@@ -104,10 +118,10 @@ impl Timer {
         
         // This can trigger a TIMA increment if it causes a falling edge!
         let bit_position: u8 = match self.tac & 0x03 {
-            0 => 9,
-            1 => 3,
-            2 => 5,
-            3 => 7,
+            0 => 9, // 4096HZ (check bit 9)
+            1 => 3, // 262144HZ (check bit 3)
+            2 => 5, // 65536HZ (check bit 5)
+            3 => 7, // 16384HZ (check bit 7)
             _ => unreachable!(),
         };
         
@@ -142,11 +156,11 @@ impl Timer {
     }
     
     pub fn set_tima(&mut self, value: u8) {
-        self.tima = value;
-        
-        // Writing to TIMA during overflow period cancels the overflow
+        // If TIMA is in overflow state, queue the write for after the overflow completes
         if self.tima_overflow {
-            self.tima_overflow = false;
+            self.queued_tima_write = Some(value);
+        } else {
+            self.tima = value;
         }
     }
     
@@ -170,10 +184,10 @@ impl Timer {
         // Changing TAC can trigger a TIMA increment if it causes a falling edge!
         if old_tac != self.tac {
             let bit_position: u8 = match self.tac & 0x03 {
-                0 => 9,
-                1 => 3,
-                2 => 5,
-                3 => 7,
+                0 => 9, // 4096HZ (check bit 9)
+                1 => 3, // 262144HZ (check bit 3)
+                2 => 5, // 65536HZ (check bit 5)
+                3 => 7, // 16384HZ (check bit 7)
                 _ => unreachable!(),
             };
             

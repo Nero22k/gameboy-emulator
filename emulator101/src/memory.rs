@@ -48,16 +48,18 @@ pub struct MemoryBus<'a> {
     joypad_debounce_delay: u8,
     
     // Serial output for tests
-    serial_data: u8,
-    serial_control: u8,
-    pub serial_output: String,
+    serial_data: u8,           // SB register (0xFF01)
+    serial_control: u8,        // SC register (0xFF02)
+    serial_transfer_active: bool,
+    serial_bit_counter: u8,
+    serial_clock_counter: u16,
 }
 
 // Lifetime 'a is used to ensure that the ROM data reference is valid for the lifetime of the MemoryBus instance.
 // This is necessary because the ROM data is stored in the cartridge and is not owned by the MemoryBus.
 impl<'a> MemoryBus<'a> {
     pub fn new(rom: &'a [u8]) -> Self {
-        Self {
+        let mut mmu = Self {
             wram: [0; 0x2000],
             hram: [0; 0x7F],
             io_registers: [0; 0x80],
@@ -67,73 +69,123 @@ impl<'a> MemoryBus<'a> {
             int_ctrl: InterruptController::new(),
             timer: Timer::new(),
             ppu: Ppu::new(),
-            joypad_select: 0x30, // Both button and direction selected (P14 and P15 high)
+            joypad_select: 0xCF, // Both button and direction selected (P14 and P15 high)
             joypad_buttons: 0x0F, // All buttons released
             joypad_dpad: 0x0F,    // All d-pad released
-            last_joypad_state: 0xFF,
+            last_joypad_state: 0xCF,
             joypad_debounce_counter: 0,
-            joypad_debounce_delay: 2,
+            joypad_debounce_delay: 1,
             serial_data: 0,
             serial_control: 0x7E,
-            serial_output: String::new(),
-        }
+            serial_transfer_active: false,
+            serial_bit_counter: 0,
+            serial_clock_counter: 0,
+        };
+        mmu.io_registers[0x0F] = 0xE1; // Set if register to post boot value
+        mmu
     }
 
-    pub fn update_joypad(&mut self) {
-        // Implement debouncing by only processing inputs
-        // after a certain number of frames
+    // Update timer for a single cycle
+    pub fn update_timer_cycle(&mut self) -> bool {
+        self.timer.update_cycle()
+    }
+    
+    // Update PPU for a single cycle
+    pub fn update_ppu_cycle(&mut self) -> Option<InterruptType> {
+        self.ppu.update_cycle()
+    }
+    
+    // Update serial for a single cycle
+    pub fn update_serial_cycle(&mut self) -> bool {
+        // Skip if transfer not active
+        if !self.serial_transfer_active {
+            return false;
+        }
+        
+        // Only handle internal clock (bit 0 of SC set)
+        if self.serial_control & 0x01 != 0 {
+            // Update clock counter
+            self.serial_clock_counter = self.serial_clock_counter.wrapping_add(1);
+            
+            // Each bit takes 512 T-cycles at normal speed
+            if self.serial_clock_counter == 512 {
+                self.serial_clock_counter -= 512;
+                
+                // Shift out a bit
+                self.serial_bit_counter += 1;
+                self.serial_data = (self.serial_data << 1) | 1; // Shift in 1s (no cable connected)
+                
+                // After 8 bits, transfer is complete
+                if self.serial_bit_counter == 8 {
+                    // Reset transfer
+                    self.serial_transfer_active = false;
+                    self.serial_bit_counter = 0;
+                    
+                    // Clear transfer bit (7) in SC
+                    self.serial_control &= 0x7F;
+                    
+                    // Request serial interrupt
+                    return true;
+                }
+            }
+        }
+        
+        false
+    }
+    
+    // Update joypad for a single cycle
+    pub fn update_joypad_cycle(&mut self) -> bool {
+        // Joypad is usually edge-triggered, so we only need to check for changes
+        // This is a simplified implementation
         if self.joypad_debounce_counter > 0 {
             self.joypad_debounce_counter -= 1;
         }
+        
+        // In a real implementation, you'd check for changes in button state here
+        // For now, just return false (no interrupt)
+        false
     }
-
-    // Update timer with the number of cycles that have passed
-    pub fn update_timer(&mut self, cycles: u8) {
-        if self.timer.update(cycles) {
-            // Request timer interrupt if timer overflowed
-            self.request_interrupt(InterruptType::Timer);
-        }
-    }
-
-    // Update PPU with the number of cycles that have passed
-    pub fn update_ppu(&mut self, cycles: u8) {
-        // First, update the PPU state and get any triggered interrupts
-        if let Some(interrupt) = self.ppu.update(cycles) {
-            // Request the appropriate interrupt
-            self.request_interrupt(interrupt);
+    
+    // Process one DMA cycle
+    pub fn process_dma_cycle(&mut self) {
+        if !self.ppu.oam_dma_active {
+            return;
         }
         
-        // Process DMA transfers - one byte per CPU cycle
-        for _ in 0..cycles {
-            // Get DMA source without borrowing self.ppu mutably
-            let dma_source = self.ppu.get_dma_source();
-            
-            // If DMA is active (source != 0)
-            if dma_source != 0 {
-                // Get current byte position
-                let byte_pos = self.ppu.get_dma_byte();
-                
-                // Calculate actual memory address
-                let addr = dma_source + (byte_pos as u16);
-                
-                // Read the byte from memory
-                let value = self.read_byte(addr);
-                
-                // Process the DMA byte (write to OAM)
-                self.ppu.process_dma_byte(value);
-            }
-        }
+        // Get current byte position
+        let byte_pos = self.ppu.get_dma_byte();
+        
+        // Calculate actual memory address
+        let addr = self.ppu.get_dma_source() + (byte_pos as u16);
+        
+        // Read the byte from memory
+        let value = self.read_byte(addr);
+        
+        // Process the DMA byte (write to OAM)
+        self.ppu.process_dma_byte(value);
     }
 
     pub fn read_byte(&self, addr: u16) -> u8 {
         match addr {
-            // ROM (0x0000-0x7FFF)
-            0x0000..=0x7FFF => {
-                if addr as u16 >= self.rom.len() as u16 {
+            // ROM bank 0 (0x0000-0x3FFF)
+            0x0000..=0x3FFF => {
+                if addr as usize >= self.rom.len() {
                     0xFF
                 } else {
                     self.rom[addr as usize]
                 }
+            },
+            // ROM bank 1-N (0x4000-0x7FFF)
+            0x4000..=0x7FFF => {
+                // The correct calculation depends on your MBC implementation
+                // For simple cases with no banking, it would be:
+                let rom_addr = addr as usize;
+                if rom_addr >= self.rom.len() {
+                    0xFF
+                } else {
+                    self.rom[rom_addr]
+                }
+                // For MBC implementations, you'd calculate the correct bank
             },
             // VRAM (0x8000-0x9FFF)
             0x8000..=0x9FFF => self.ppu.read_vram(addr),
@@ -205,40 +257,36 @@ impl<'a> MemoryBus<'a> {
         }
     }
 
-    /*
-    Had silly issue where having serial registers would break my emulator with games like Tetris and Tennis.
-    */
-
     fn read_io(&self, addr: u16) -> u8 {
         match addr {
             // Joypad
             0xFF00 => {
-                // Default state: All inputs inactive (1), both button groups selected (0)
-                let mut result = self.joypad_select;
-    
-                // If action buttons are selected (P15 = 0)
                 if self.joypad_select & 0x20 == 0 {
-                    result &= 0xF0 | self.joypad_buttons;
+                    // If action buttons are selected (P15 = 0)
+                    0xC0 | (self.joypad_select & 0x30) | self.joypad_buttons
+                } else if self.joypad_select & 0x10 == 0 {
+                    // If direction buttons are selected (P14 = 0)
+                    0xC0 | (self.joypad_select & 0x30) | self.joypad_dpad
+                } else {
+                    0xCF
                 }
-                
-                // If direction buttons are selected (P14 = 0)
-                if self.joypad_select & 0x10 == 0 {
-                    result &= 0xF0 | self.joypad_dpad;
-                }
-                
-                result
             },
             // Serial Transfer Data
-            //0xFF01 => self.serial_data,
+            0xFF01 => self.serial_data,
             
             // Serial Transfer Control
-            //0xFF02 => self.serial_control,
+            0xFF02 => self.serial_control,
 
             // Timer registers
             0xFF04 => self.timer.get_div(),
             0xFF05 => self.timer.get_tima(),
             0xFF06 => self.timer.get_tma(),
             0xFF07 => self.timer.get_tac(),
+
+            // Audio
+            0xFF24 => 0x77, // Sound control register
+            0xFF25 => 0xF3, // Sound output terminal selection
+            0xFF26 => 0xF1, // Sound on/off
             
             // Interrupt Flag (0xFF0F)
             0xFF0F => self.get_if(),
@@ -256,37 +304,25 @@ impl<'a> MemoryBus<'a> {
             // Joypad
             0xFF00 => {
                 // Only bits 4-5 are writable (selection bits)
-                self.joypad_select = (value & 0x30) | 0x0F;
+                self.joypad_select = 0xC0 | (value & 0x30) | (self.joypad_select & 0xF); // bit 7 and 6 unused and always 1
             },
             // Serial Transfer Data
-            /*0xFF01 => {
+            0xFF01 => {
                 self.serial_data = value;
             },
             
             // Serial Transfer Control
             0xFF02 => {
-                self.serial_control = value;
+                self.serial_control = value & 0x83; // Only bits 0, 1, and 7 are writable
                 
-                // Handle serial transfer (for Blargg's test ROMs)
-                // If bit 7 is set, the serial transfer is in progress
-                if value & 0x80 != 0 {
-                    let data = self.serial_data;
-                    
-                    // Only add printable characters to the output string
-                    if data >= 0x20 && data <= 0x7E {
-                        let c = data as char;
-                        self.serial_output.push(c);
-                    } else if data == 0x0A { // Handle newline
-                        self.serial_output.push('\n');
-                    }
-                    
-                    // Auto-acknowledge the transfer by clearing bit 7
-                    self.serial_control &= 0x7F;
-                    
-                    // Request Serial interrupt
-                    self.request_interrupt(InterruptType::Serial);
+                // Check if transfer start requested (bit 7 changed from 0 to 1)
+                if self.serial_control & 0x80 != 0 {
+                    // Start a new transfer
+                    self.serial_transfer_active = true;
+                    self.serial_bit_counter = 0;
+                    self.serial_clock_counter = 0;
                 }
-            },*/
+            },
 
             // Timer registers
             0xFF04 => self.timer.set_div(value),
@@ -298,13 +334,7 @@ impl<'a> MemoryBus<'a> {
             0xFF0F => self.set_if(value), // Only bits 0-4 are used
 
             // PPU registers
-            0xFF40..=0xFF4B => {
-                if addr == 0xFF46 {
-                    self.ppu.begin_oam_dma(value);
-                } else {
-                    self.ppu.write_register(addr, value);
-                }
-            },
+            0xFF40..=0xFF4B => self.ppu.write_register(addr, value),
             
             // Other I/O registers
             _ => self.io_registers[(addr - 0xFF00) as usize] = value,
@@ -324,21 +354,21 @@ impl<'a> MemoryBus<'a> {
     The key insight is that on the original Game Boy hardware,
     the unused bits (5-7) of the IE register at address 0xFFFF always read as "1".
     */
-    
-    pub fn get_if(&self) -> u8 {
-        self.io_registers[0x0F] | 0xE0 // Always read bits 5-7 as 1
-    }
-    
+
     pub fn set_if(&mut self, value: u8) {
         self.io_registers[0x0F] = (value & 0x1F) | 0xE0; // Only bits 0-4 are writable, bits 5-7 always 1
-    }
-    
-    pub fn get_ie(&self) -> u8 {
-        self.ie_register | 0xE0 // Always read bits 5-7 as 1
     }
 
     pub fn set_ie(&mut self, value: u8) {
         self.ie_register = (value & 0x1F) | 0xE0; // Only bits 0-4 are writable, bits 5-7 always 1
+    }
+
+    pub fn get_ie(&self) -> u8 {
+        self.ie_register | 0xE0  // Ensure bits 5-7 always read as 1
+    }
+    
+    pub fn get_if(&self) -> u8 {
+        self.io_registers[0x0F]
     }
 
     pub fn handle_key_event(&mut self, key: Keycode, pressed: bool) {
