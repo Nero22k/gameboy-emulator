@@ -25,7 +25,16 @@ enum ViewerTab {
     Palettes,
 }
 
+struct HoveredTile {
+    index: usize,
+    address: u16,
+    screen_x: i32,
+    screen_y: i32,
+    tab: ViewerTab,
+}
+
 // Options for the viewer
+#[allow(dead_code)]
 struct ViewerOptions {
     show_grid: bool,
     show_palettes: bool,
@@ -34,6 +43,7 @@ struct ViewerOptions {
     tile_offset: u16,     // For scrolling through tiles
     bg_map_offset: u16,   // 0x9800 or 0x9C00
     current_tab: ViewerTab,
+    hovered_tile: Option<HoveredTile>,
 }
 
 pub struct VramViewer {
@@ -69,6 +79,7 @@ impl VramViewer {
             tile_offset: 0,
             bg_map_offset: 0x9800,
             current_tab: ViewerTab::BgMap,
+            hovered_tile: None,
         };
         
         Ok(VramViewer {
@@ -98,15 +109,113 @@ impl VramViewer {
         }
         
         match event {
-            Event::KeyDown { keycode: Some(Keycode::Tab), .. } => {
-                // Cycle through tabs
-                self.options.current_tab = match self.options.current_tab {
-                    ViewerTab::BgMap => ViewerTab::Tiles,
-                    ViewerTab::Tiles => ViewerTab::Oam,
-                    ViewerTab::Oam => ViewerTab::Palettes,
-                    ViewerTab::Palettes => ViewerTab::BgMap,
-                };
-                true
+            // Switching tabs by clicking
+            Event::MouseButtonDown { mouse_btn: sdl2::mouse::MouseButton::Left, x, y, .. } => {
+                // Check if click is within the tab area
+                if *y < 25 {
+                    let tab_width = 80;
+                    let tab_padding = 5;
+
+                    // Determine which tab was clicked
+                    let tab_index = *x / (tab_width + tab_padding);
+                    if tab_index < 4 {
+                        self.options.current_tab = match tab_index {
+                            0 => ViewerTab::BgMap,
+                            1 => ViewerTab::Tiles,
+                            2 => ViewerTab::Oam,
+                            3 => ViewerTab::Palettes,
+                            _ => self.options.current_tab,
+                        };
+                        return true;
+                    }
+                }
+                false
+            },
+            Event::MouseMotion { x, y, .. } => {
+                // Clear hover state when moving the mouse outside of content area
+                if *y < 30 { // Below tabs but above content
+                    self.options.hovered_tile = None;
+                    return false;
+                }
+
+                // Calculate which tile is being hovered based on current tab
+                match self.options.current_tab {
+                    ViewerTab::BgMap => {
+                        // For background map view
+                        let content_x = *x;
+                        let content_y = *y - 30; // Adjust for tab height
+
+                        // Calculate tile position
+                        let tile_x = content_x as u32 / (TILE_WIDTH * TILE_DISPLAY_SCALE);
+                        let tile_y = content_y as u32 / (TILE_HEIGHT * TILE_DISPLAY_SCALE);
+
+                        if tile_x < BG_MAP_WIDTH && tile_y < BG_MAP_HEIGHT {
+                            let map_idx = tile_y * BG_MAP_WIDTH + tile_x;
+                            let map_addr = self.options.bg_map_offset + map_idx as u16;
+                            self.options.hovered_tile = Some(HoveredTile {
+                                index: map_idx as usize,
+                                address: map_addr,
+                                screen_x: *x,
+                                screen_y: *y,
+                                tab: ViewerTab::BgMap,
+                            });
+                            return true;
+                        }
+                    },
+                    ViewerTab::Tiles => {
+                        // For tiles view
+                        let content_x = *x;
+                        let content_y = *y - 30; // Adjust for tab height
+                        
+                        // Calculate tile position
+                        let tile_x = content_x as u32 / (TILE_WIDTH * TILE_DISPLAY_SCALE);
+                        let tile_y = content_y as u32 / (TILE_HEIGHT * TILE_DISPLAY_SCALE);
+                        
+                        if tile_x < GRID_WIDTH {
+                            let tile_idx = (tile_y * GRID_WIDTH + tile_x) as usize;
+                            if tile_idx < 384 { // Valid tile index
+                                let tile_addr = 0x8000 + (tile_idx as u16) * 16;
+                                self.options.hovered_tile = Some(HoveredTile {
+                                    index: tile_idx,
+                                    address: tile_addr,
+                                    screen_x: *x,
+                                    screen_y: *y,
+                                    tab: ViewerTab::Tiles,
+                                });
+                                return true;
+                            }
+                        }
+                    },
+                    ViewerTab::Oam => {
+                        let content_x = *x;
+                        let content_y = *y - 30; // Adjust for tab height
+                        
+                        // Calculate sprite position
+                        let sprite_x = content_x as u32 / (TILE_WIDTH * TILE_DISPLAY_SCALE);
+                        let sprite_y = content_y as u32 / (TILE_HEIGHT * TILE_DISPLAY_SCALE);
+                        
+                        if sprite_x < 10 && sprite_y < 4 { // 10x4 grid of sprites
+                            let sprite_idx = sprite_y * 10 + sprite_x;
+                            if sprite_idx < 40 { // Valid sprite index
+                                self.options.hovered_tile = Some(HoveredTile {
+                                    index: sprite_idx as usize,
+                                    address: 0xFE00 + (sprite_idx as u16 * 4), // OAM starts at 0xFE00
+                                    screen_x: *x,
+                                    screen_y: *y,
+                                    tab: ViewerTab::Oam,
+                                });
+                                return true;
+                            }
+                        }
+                    },
+                    _ => {
+                        // Clear hover state for other tabs
+                        self.options.hovered_tile = None;
+                    }
+                }
+                // Clear hover state if not hovering over a valid tile
+                self.options.hovered_tile = None;
+                false
             },
             Event::KeyDown { keycode: Some(Keycode::G), .. } => {
                 // Toggle grid
@@ -131,7 +240,9 @@ impl VramViewer {
         }
     }
     
+    // Update method
     pub fn update(&mut self, ppu: &Ppu) -> Result<(), String> {
+        // Check if viewer is open
         if !self.is_open {
             return Ok(());
         }
@@ -153,9 +264,63 @@ impl VramViewer {
         
         // Render sidebar info
         self.render_sidebar(ppu)?;
+
+        // Draw tooltip if a tile is being hovered
+        if self.options.hovered_tile.is_some() {
+            self.draw_tile_tooltip()?;
+        }
         
         // Present the canvas
         self.canvas.present();
+        
+        Ok(())
+    }
+
+    fn draw_tile_tooltip(&mut self) -> Result<(), String> {
+        if let Some(hover_info) = &self.options.hovered_tile {
+            // Create a background for the tooltip
+            let tooltip_width = 120;
+            let tooltip_height = 40;
+
+            // Position the tooltip near the mouse but ensure it stays on the screen
+            let mut tooltip_x = hover_info.screen_x + 15; // Offset from cursor
+            let mut tooltip_y = hover_info.screen_y + 15;
+
+            let (window_width, window_height) = self.canvas.output_size().unwrap();
+
+            // Adjust position if tooltip would go off-screen
+            if tooltip_x + tooltip_width > window_width as i32 {
+                tooltip_x = hover_info.screen_x - tooltip_width - 5;
+            }
+            if tooltip_y + tooltip_height > window_height as i32 {
+                tooltip_y = hover_info.screen_y - tooltip_height - 5;
+            }
+
+            // Draw tooltip background
+            let tooltip_rect = Rect::new(tooltip_x, tooltip_y, tooltip_width as u32, tooltip_height as u32);
+            self.canvas.set_draw_color(Color::RGBA(240, 240, 200, 230));
+            self.canvas.fill_rect(tooltip_rect)?;
+            
+            // Draw tooltip border
+            self.canvas.set_draw_color(Color::RGB(100, 100, 100));
+            self.canvas.draw_rect(tooltip_rect)?;
+            
+            // Draw tile information text
+            let tab_name = match hover_info.tab {
+                ViewerTab::Tiles => "Tile",
+                ViewerTab::BgMap => "BG Map",
+                ViewerTab::Oam => "Sprite",
+                ViewerTab::Palettes => "Palette",
+            };
+            
+            // Format the tooltip text based on the tab
+            let index_text = format!("{}: #{}", tab_name, hover_info.index);
+            let addr_text = format!("Addr: ${:04X}", hover_info.address);
+            
+            // Draw the text
+            self.draw_text(&index_text, tooltip_x + 5, tooltip_y + 5, Color::RGB(0, 0, 0))?;
+            self.draw_text(&addr_text, tooltip_x + 5, tooltip_y + 20, Color::RGB(0, 0, 0))?;
+        }
         
         Ok(())
     }
@@ -427,23 +592,6 @@ impl VramViewer {
                 )?;
             }
         }
-        
-        // If window visible, draw a highlight around the visible portion
-        /*if ppu.lcdc & 0x20 != 0 && ppu.wy < 144 && ppu.wx <= 166 {
-            // Calculate visible window region
-            let window_left = ppu.wx.saturating_sub(7) as i32;
-            let window_top = ppu.wy as i32;
-            
-            // Highlight visible window region
-            self.canvas.set_draw_color(Color::RGB(0, 0, 255));
-            let highlight_rect = Rect::new(
-                window_left * TILE_DISPLAY_SCALE as i32,
-                30 + window_top * TILE_DISPLAY_SCALE as i32,
-                (SCREEN_WIDTH as i32 - window_left) as u32 * TILE_DISPLAY_SCALE / 8,
-                (SCREEN_HEIGHT as i32 - window_top) as u32 * TILE_DISPLAY_SCALE / 8
-            );
-            self.canvas.draw_rect(highlight_rect)?;
-        }*/
         
         // Also highlight visible screen area
         self.canvas.set_draw_color(Color::RGB(255, 0, 0));
