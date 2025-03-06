@@ -13,6 +13,21 @@
 
 ---
 
+## Games
+
+![Tennis_World](https://github.com/user-attachments/assets/75b1aa41-e49c-4b4c-84bf-63380e3dc411)
+
+![Alleyway](https://github.com/user-attachments/assets/8af08853-9e49-41ad-a97e-625f3fa430e2)
+
+![Dr_Mario](https://github.com/user-attachments/assets/18213b10-ca14-42be-a7bf-806109ecfb0f)
+
+![Tetris](https://github.com/user-attachments/assets/3d170c48-e174-4542-ade5-5d6bc3fb4355)
+
+## VRAM Viewer
+
+![VRAM_Viewer](https://github.com/user-attachments/assets/59c05fb3-4eb4-4d8b-974b-be22438244cc)
+
+
 ## Checklist
 
 ### **1. CPU (LR35902)**
