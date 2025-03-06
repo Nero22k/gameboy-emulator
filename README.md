@@ -27,6 +27,55 @@
 
 ![VRAM_Viewer](https://github.com/user-attachments/assets/59c05fb3-4eb4-4d8b-974b-be22438244cc)
 
+## Passed tests:
+
+### CPU tests:
+
+| Test              | Status |
+|-------------------|--------|
+| `cpu_instrs.gb`   | ✅      |
+| `halt_bug.gb`     | ✅      |
+| `instr_timing.gb` | ✅      |
+| `daa.gb`          | ✅      |
+
+#### Timer tests:
+
+| Test                      | Status |
+|---------------------------|---------|
+| `div_write.gb`            | ✅      |
+| `tim00.gb`                | ✅      |
+| `tim00_div_trigger.gb`    | ✅      |
+| `tim01.gb`                | ✅      |
+| `tim01_div_trigger.gb`    | ✅      |
+| `tim10.gb`                | ✅      |
+| `tim10_div_trigger.gb`    | ✅      |
+| `tim11.gb`                | ✅      |
+| `tim11_div_trigger.gb`    | ✅      |
+| `tima_reload.gb`          | ✅      |
+
+#### Bits tests:
+| Test                      | Status |
+|---------------------------|---------|
+| `mem_oam.gb`              | ✅      |
+| `reg_f.gb`                | ✅      |
+
+#### Interrupts tests:
+| Test                      | Status |
+|---------------------------|---------|
+| `ie_push.gb`              | ✅      |
+
+#### OAM DMA tests:
+| Test                      | Status |
+|---------------------------|---------|
+| `basic.gb`                | ✅      |
+| `reg_read.gb`             | ✅      |
+
+#### Misc tests:
+| Test                      | Status |
+|---------------------------|---------|
+| `boot_regs-dmgABC.gb`     | ✅      |
+| `div_timing.gb`           | ✅      |
+| `if_ie_registers.gb`      | ✅      |
 
 ## Checklist
 
@@ -124,8 +173,7 @@
 
 ### **13. Performance & Compatibility**
 - [ ] **Cycle-Accurate Timing** for CPU, PPU, APU if aiming for high accuracy  
-- [ ] **Speed** (60 FPS target) with no audio cracks or frame drops  
-- [X] **Pass basic test ROMs** (e.g., Blargg’s CPU tests, Mooneye-GB tests)  
+- [ ] **Speed** (60 FPS target) with no audio cracks or frame drops
 - [ ] **Save States** (serialize CPU/PPU/APU states)
 
 ---
