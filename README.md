@@ -52,6 +52,7 @@
 | `tim11.gb`                | ✅      |
 | `tim11_div_trigger.gb`    | ✅      |
 | `tima_reload.gb`          | ✅      |
+| `div_timing.gb`           | ✅      |
 
 #### Bits tests:
 | Test                      | Status |
@@ -74,7 +75,6 @@
 | Test                      | Status |
 |---------------------------|---------|
 | `boot_regs-dmgABC.gb`     | ✅      |
-| `div_timing.gb`           | ✅      |
 | `if_ie_registers.gb`      | ✅      |
 
 ## Checklist
