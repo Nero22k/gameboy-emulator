@@ -276,58 +276,6 @@ impl Cpu {
         println!("halted: {}", self.halted);
     }
 
-    // Execute a single instruction
-    /*pub fn step<'a>(&mut self, memory: &mut MemoryBus<'a>) -> u8 {
-        // First, handle any pending interrupts
-        let mut total_cycles = 0;
-        
-        // Only process interrupts if IME is enabled or if HALT checking needs to happen
-        if self.ime || self.halted {
-            let interrupt_cycles = self.handle_interrupts(memory);
-            total_cycles += interrupt_cycles;
-            
-            // If we spent cycles handling an interrupt, return without executing an instruction
-            if interrupt_cycles > 0 {
-                return interrupt_cycles;
-            }
-        }
-        
-        // If halted, check if we should wake up
-        if self.halted {
-            if InterruptController::has_pending_interrupts(memory) {
-                self.halted = false;
-            } else {
-                // Stay halted for 4 T-cycles
-                self.cycle_count += 4;
-                return 4;
-            }
-        }
-        
-        // Execute an instruction
-        let opcode = self.fetch_byte(memory);
-    
-        if self.halt_bug {
-            self.pc = self.pc.wrapping_sub(1);
-            self.halt_bug = false;
-        }
-        
-        let cycles = self.execute_instruction(opcode, memory);
-        total_cycles += cycles;
-        
-        // Handle EI's delayed effect
-        if self.pending_ime {
-            self.ime = true;
-            self.pending_ime = false;
-        }
-        
-        //self.debugging(memory, opcode);
-
-        // Count cycles
-        self.cycle_count += total_cycles as u64;
-        
-        total_cycles
-    }*/
-
     pub fn tick<'a>(&mut self, memory: &mut MemoryBus<'a>) -> u8 {
         if memory.is_memory_access_in_progress() {
             return 1; // Return 1 m-cycle
