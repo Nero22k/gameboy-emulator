@@ -1,5 +1,6 @@
 use crate::interrupts::{InterruptController, InterruptType};
 use crate::timer::Timer;
+use crate::clock::Clock;
 use crate::ppu::Ppu;
 use sdl2::keyboard::Keycode;
 
@@ -53,6 +54,21 @@ pub struct MemoryBus<'a> {
     serial_transfer_active: bool,
     serial_bit_counter: u8,
     serial_clock_counter: u16,
+
+    clock: Clock,
+    memory_access_in_progress: bool,
+    memory_access_cycles_remaining: u8,
+    memory_access_type: MemoryAccessType,
+    memory_access_address: u16,
+    memory_access_value: Option<u8>,
+}
+
+#[derive(PartialEq)]
+enum MemoryAccessType {
+    Read,
+    Write,
+    DMA,
+    None,
 }
 
 // Lifetime 'a is used to ensure that the ROM data reference is valid for the lifetime of the MemoryBus instance.
@@ -80,6 +96,12 @@ impl<'a> MemoryBus<'a> {
             serial_transfer_active: false,
             serial_bit_counter: 0,
             serial_clock_counter: 0,
+            clock: Clock::new(),
+            memory_access_in_progress: false,
+            memory_access_cycles_remaining: 0,
+            memory_access_type: MemoryAccessType::None,
+            memory_access_address: 0,
+            memory_access_value: None,
         };
         mmu.io_registers[0x0F] = 0xE1; // Set if register to post boot value
         mmu
@@ -133,7 +155,7 @@ impl<'a> MemoryBus<'a> {
         false
     }
     
-    // Update joypad for a single cycle
+    // Update joypad_cycle to only check for interrupts
     pub fn update_joypad_cycle(&mut self) -> bool {
         // Joypad is usually edge-triggered, so we only need to check for changes
         // This is a simplified implementation
@@ -153,19 +175,164 @@ impl<'a> MemoryBus<'a> {
         }
         
         // Get current byte position
-        let byte_pos = self.ppu.get_dma_byte();
+        let byte_pos = self.ppu.oam_dma_byte;
+        let addr = self.ppu.oam_dma_source + (byte_pos as u16);
         
-        // Calculate actual memory address
-        let addr = self.ppu.get_dma_source() + (byte_pos as u16);
+        // Read the byte from memory (bypass memory access timing for DMA)
+        let value = match addr {
+            // Direct memory access implementation without setting memory_access_in_progress
+            // (Copy your read_byte logic here but without the timing code)
+            // ROM bank 0 (0x0000-0x3FFF)
+            0x0000..=0x3FFF => {
+                if addr as usize >= self.rom.len() {
+                    0xFF
+                } else {
+                    self.rom[addr as usize]
+                }
+            },
+            // ROM bank 1-N (0x4000-0x7FFF)
+            0x4000..=0x7FFF => {
+                // The correct calculation depends on your MBC implementation
+                // For simple cases with no banking, it would be:
+                let rom_addr = addr as usize;
+                if rom_addr >= self.rom.len() {
+                    0xFF
+                } else {
+                    self.rom[rom_addr]
+                }
+                // For MBC implementations, you'd calculate the correct bank
+            },
+            // VRAM (0x8000-0x9FFF)
+            0x8000..=0x9FFF => self.ppu.read_vram(addr),
+            // External RAM (0xC000-0xDFFF)
+            0xA000..=0xBFFF => {
+                let addr = (addr - 0xA000) as u16;
+                if (addr as u16) < self.eram.len() as u16 {
+                    self.eram[addr as usize]
+                } else {
+                    0xFF
+                }
+            },
+            // Working RAM (0xC000-0xDFFF)
+            0xC000..=0xDFFF => self.wram[(addr - 0xC000) as usize],
+            
+            // Echo RAM (0xE000-0xFDFF)
+            0xE000..=0xFDFF => self.wram[(addr - 0xE000) as usize],
+
+            // OAM (0xFE00-0xFE9F)
+            0xFE00..=0xFE9F => self.ppu.read_oam(addr),
+            
+            // I/O Registers (0xFF00-0xFF7F)
+            0xFF00..=0xFF7F => self.read_io(addr),
+            
+            // High RAM (0xFF80-0xFFFE)
+            0xFF80..=0xFFFE => self.hram[(addr - 0xFF80) as usize],
+            
+            // Interrupt Enable
+            0xFFFF => self.get_ie(),
+            
+            // Unused memory regions
+            _ => 0xFF,
+        };
         
-        // Read the byte from memory
-        let value = self.read_byte(addr);
+        self.ppu.write_oam_internal(byte_pos as u16, value);
         
-        // Process the DMA byte (write to OAM)
-        self.ppu.process_dma_byte(value);
+        // Increment byte position
+        self.ppu.oam_dma_byte += 1;
+        
+        // Check if DMA is complete
+        if self.ppu.oam_dma_byte >= 0xA0 {
+            self.ppu.oam_dma_active = false;
+            self.ppu.oam_dma_byte = 0;
+            // DMA is complete, but memory is still blocked for a few more cycles
+        }
     }
 
-    pub fn read_byte(&self, addr: u16) -> u8 {
+    pub fn begin_oam_dma(&mut self, value: u8) {        
+        // Start DMA in PPU
+        self.ppu.begin_oam_dma(value);
+        
+        // Block CPU access to most memory during DMA
+        self.memory_access_in_progress = true;
+        self.memory_access_type = MemoryAccessType::DMA; // Add this enum variant
+        self.memory_access_cycles_remaining = 160; // 160 m-cycles
+    }
+
+    pub fn tick(&mut self) -> Option<InterruptType> {
+        let mut interrupt = None;
+        
+        // Process memory access if in progress
+        if self.memory_access_in_progress {
+            self.memory_access_cycles_remaining -= 1;
+            
+            if self.memory_access_cycles_remaining == 0 {
+                self.memory_access_in_progress = false;
+                self.memory_access_type = MemoryAccessType::None;
+            }
+        }
+
+        // Process DMA transfers (one byte per m-cycle)
+        if self.ppu.oam_dma_active {
+            self.process_dma_cycle();
+        }
+        
+        // (4 t-cycles = 1 m-cycle)
+        for _ in 0..4 {
+            if self.update_timer_cycle() {
+                self.request_interrupt(InterruptType::Timer);
+            }
+        }
+        
+        for _ in 0..4 {
+            if let Some(ppu_interrupt) = self.update_ppu_cycle() {
+                interrupt = Some(ppu_interrupt);
+                self.request_interrupt(ppu_interrupt);
+            }
+        }
+        
+        for _ in 0..4 {
+            if self.update_serial_cycle() {
+                self.request_interrupt(InterruptType::Serial);
+            }
+        }
+        
+        for _ in 0..4 {
+            if self.update_joypad_cycle() {
+                self.request_interrupt(InterruptType::Joypad);
+            }
+        }
+        
+        // Advance the clock
+        self.clock.tick(1);
+        
+        interrupt
+    }
+
+    pub fn read_byte(&mut self, addr: u16) -> u8 {
+        // During DMA, CPU can only access HRAM
+        if self.memory_access_type == MemoryAccessType::DMA && !(addr >= 0xFF80 && addr <= 0xFFFE) {
+            // Return 0xFF for inaccessible memory during DMA
+            return 0xFF;
+        }
+        // Start memory access timing
+        self.memory_access_in_progress = true;
+        self.memory_access_type = MemoryAccessType::Read;
+        self.memory_access_address = addr;
+        
+        // Set access cycles based on memory region
+        self.memory_access_cycles_remaining = match addr {
+            0x0000..=0x7FFF => 1, // ROM: 1 m-cycle
+            0x8000..=0x9FFF => 1, // VRAM: 1 m-cycle
+            0xA000..=0xBFFF => 1, // External RAM: 1 m-cycle
+            0xC000..=0xDFFF => 1, // WRAM: 1 m-cycle
+            0xE000..=0xFDFF => 1, // Echo RAM: 1 m-cycle
+            0xFE00..=0xFE9F => 1, // OAM: 1 m-cycle
+            0xFF00..=0xFF7F => 1, // I/O: 1 m-cycle
+            0xFF80..=0xFFFE => 1, // HRAM: 1 m-cycle
+            0xFFFF => 1,          // IE: 1 m-cycle
+            _ => 1,
+        };
+
         match addr {
             // ROM bank 0 (0x0000-0x3FFF)
             0x0000..=0x3FFF => {
@@ -222,6 +389,31 @@ impl<'a> MemoryBus<'a> {
     }
 
     pub fn write_byte(&mut self, addr: u16, value: u8) {
+        // During DMA, CPU can only access HRAM
+        if self.memory_access_type == MemoryAccessType::DMA && !(addr >= 0xFF80 && addr <= 0xFFFE) {
+            // Return 0xFF for inaccessible memory during DMA
+            return;
+        }
+        // Start memory access timing
+        self.memory_access_in_progress = true;
+        self.memory_access_type = MemoryAccessType::Write;
+        self.memory_access_address = addr;
+        self.memory_access_value = Some(value);
+        
+        // Set access cycles based on memory region
+        self.memory_access_cycles_remaining = match addr {
+            0x0000..=0x7FFF => 1, // ROM: 1 m-cycle
+            0x8000..=0x9FFF => 1, // VRAM: 1 m-cycle
+            0xA000..=0xBFFF => 1, // External RAM: 1 m-cycle
+            0xC000..=0xDFFF => 1, // WRAM: 1 m-cycle
+            0xE000..=0xFDFF => 1, // Echo RAM: 1 m-cycle
+            0xFE00..=0xFE9F => 1, // OAM: 1 m-cycle
+            0xFF00..=0xFF7F => 1, // I/O: 1 m-cycle
+            0xFF80..=0xFFFE => 1, // HRAM: 1 m-cycle
+            0xFFFF => 1,          // IE: 1 m-cycle
+            _ => 1,
+        };
+
         match addr {
             // VRAM (0x8000-0x9FFF)
             0x8000..=0x9FFF => self.ppu.write_vram(addr, value),
@@ -334,11 +526,21 @@ impl<'a> MemoryBus<'a> {
             0xFF0F => self.set_if(value), // Only bits 0-4 are used
 
             // PPU registers
-            0xFF40..=0xFF4B => self.ppu.write_register(addr, value),
+            0xFF40..=0xFF4B => {
+                if addr == 0xFF46 {
+                    self.begin_oam_dma(value);
+                } else {
+                    self.ppu.write_register(addr, value);
+                }
+            },
             
             // Other I/O registers
             _ => self.io_registers[(addr - 0xFF00) as usize] = value,
         }
+    }
+
+    pub fn is_memory_access_in_progress(&self) -> bool {
+        self.memory_access_in_progress
     }
 
     // Methods for interrupt handling

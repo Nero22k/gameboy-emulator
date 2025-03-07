@@ -1,5 +1,6 @@
 use crate::memory::MemoryBus;
 use crate::interrupts::{InterruptController, InterruptType};
+use crate::clock::Clock;
 
 struct Flags {
     z: bool, // Zero flag
@@ -62,7 +63,7 @@ pub struct Cpu {
     halt_bug: bool,    // for HALT bug tracking
     
     // Cycle counting
-    pub cycle_count: u64,
+    m_cycle_count: u64,
 }
 
 impl Cpu {
@@ -80,7 +81,7 @@ impl Cpu {
             ime: false,
             pending_ime: false,
             halt_bug: false,
-            cycle_count: 0,
+            m_cycle_count: 0,
         }
     }
 
@@ -102,7 +103,7 @@ impl Cpu {
         self.ime = false;
         self.pending_ime = false;
         self.halt_bug = false;
-        self.cycle_count = 0;
+        self.m_cycle_count = 0;
     }
 
     // Get register BC as 16-bit
@@ -219,14 +220,14 @@ impl Cpu {
     }
     
     // Fetch the next byte from memory and increment PC
-    fn fetch_byte<'a>(&mut self, memory: &'a MemoryBus) -> u8 {
+    fn fetch_byte<'a>(&mut self, memory: &mut MemoryBus<'a>) -> u8 {
         let byte = memory.read_byte(self.pc);
         self.pc = self.pc.wrapping_add(1);
         byte
     }
     
     // Fetch the next 16-bit word from memory and increment PC
-    fn fetch_word<'a>(&mut self, memory: &'a MemoryBus) -> u16 {
+    fn fetch_word<'a>(&mut self, memory: &mut MemoryBus<'a>) -> u16 {
         let lo = self.fetch_byte(memory) as u16;
         let hi = self.fetch_byte(memory) as u16;
         (hi << 8) | lo
@@ -247,7 +248,7 @@ impl Cpu {
     }
     
     // Pop a 16-bit value from the stack
-    fn pop_word<'a>(&mut self, memory: &'a MemoryBus) -> u16 {
+    fn pop_word<'a>(&mut self, memory: &mut MemoryBus<'a>) -> u16 {
         let lo = memory.read_byte(self.sp) as u16;
         self.sp = self.sp.wrapping_add(1);
         let hi = memory.read_byte(self.sp) as u16;
@@ -276,7 +277,7 @@ impl Cpu {
     }
 
     // Execute a single instruction
-    pub fn step<'a>(&mut self, memory: &mut MemoryBus<'a>) -> u8 {
+    /*pub fn step<'a>(&mut self, memory: &mut MemoryBus<'a>) -> u8 {
         // First, handle any pending interrupts
         let mut total_cycles = 0;
         
@@ -325,6 +326,44 @@ impl Cpu {
         self.cycle_count += total_cycles as u64;
         
         total_cycles
+    }*/
+
+    pub fn tick<'a>(&mut self, memory: &mut MemoryBus<'a>) -> u8 {
+        if memory.is_memory_access_in_progress() {
+            return 1; // Return 1 m-cycle
+        }
+        // If halted, check if we should wake up
+        if self.halted {
+            if InterruptController::has_pending_interrupts(memory) {
+                self.halted = false;
+            } else {
+                // Stay halted for 1 m-cycle
+                self.m_cycle_count += 1;
+                return 1;
+            }
+        }
+        
+        // Execute an instruction
+        let opcode = self.fetch_byte(memory);
+    
+        if self.halt_bug {
+            self.pc = self.pc.wrapping_sub(1);
+            self.halt_bug = false;
+        }
+        
+        // Execute the instruction and get m-cycles
+        let m_cycles = Clock::t_to_m_cycles(self.execute_instruction(opcode, memory));
+        
+        // Handle EI's delayed effect
+        if self.pending_ime {
+            self.ime = true;
+            self.pending_ime = false;
+        }
+        
+        // Count cycles
+        self.m_cycle_count += m_cycles as u64;
+        
+        m_cycles
     }
 
     // Process pending interrupts
@@ -335,9 +374,9 @@ impl Cpu {
        4. If another interrupt is found, we proceed with that one instead
        5. Only if no interrupts remain enabled do we cancel the entire process
     */
-    fn handle_interrupts<'a>(&mut self, memory: &mut MemoryBus<'a>) -> u8 {
+    pub fn handle_interrupts<'a>(&mut self, memory: &mut MemoryBus<'a>) -> bool {
         if !self.ime {
-            return 0;
+            return false;
         }
         
         // Check if any interrupts are pending
@@ -370,7 +409,7 @@ impl Cpu {
                 if pending_after == 0 {
                     // All interrupts were disabled - cancel and set PC to 0x0000
                     self.pc = 0x0000;
-                    return 20;
+                    return true;
                 }
                 
                 // Check if the original highest priority interrupt was disabled
@@ -391,11 +430,11 @@ impl Cpu {
                         // Jump to the new interrupt vector
                         self.pc = InterruptController::get_interrupt_vector(new_interrupt);
                         
-                        return 20;
+                        return true;
                     } else {
                         // No other interrupts are enabled - cancel
                         self.pc = 0x0000;
-                        return 20;
+                        return true;
                     }
                 }
             }
@@ -410,11 +449,11 @@ impl Cpu {
             // Step 4: Jump to interrupt vector
             self.pc = InterruptController::get_interrupt_vector(original_interrupt);
             
-            // Return the number of cycles
-            return 20;
+            // Return true to indicate that an interrupt was handled
+            return true;
         }
         
-        0 // No interrupt handled
+        false // No interrupt handled
     }
 
     // Execute a single instruction
@@ -3065,7 +3104,7 @@ impl Cpu {
         self.set_a(a);
     }
 
-    fn cpu_jr<'a>(&mut self, memory: &'a MemoryBus, condition: bool) -> u8 {
+    fn cpu_jr<'a>(&mut self, memory: &mut MemoryBus<'a>, condition: bool) -> u8 {
         if condition {
             let n = self.fetch_byte(memory) as i8;
             self.pc = ((self.pc as u32 as i32) + (n as i32)) as u16;

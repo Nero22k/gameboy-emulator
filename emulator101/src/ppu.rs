@@ -1,10 +1,5 @@
 // Pixel Processing Unit (PPU) module
 // The PPU is responsible for rendering the graphics of the Game
-
-// TODO: FIX STAT INTERRUPTS
-// TODO: FIX SLOW FRAME RATE CAUSED BY BUSY WAITING
-// TODO: FIX PPU SO THAT IT PASSES DMG-ACID TESTS and MOONEYE TESTS
-
 use crate::interrupts::InterruptType;
 
 pub const SCREEN_WIDTH: usize = 160;
@@ -24,13 +19,25 @@ const OBP1: u16 = 0xFF49; // Object Palette 1 Data
 const WY: u16 = 0xFF4A;   // Window Y Position
 const WX: u16 = 0xFF4B;   // Window X Position
 
+// PPU Mode timing constants
+const MODE2_CYCLES: u32 = 80;    // OAM scan (Mode 2) - 80 cycles
+const MODE3_CYCLES: u32 = 172;   // Drawing (Mode 3) - 172 cycles (can vary based on sprites)
+const LINE_CYCLES: u32 = 456;    // Total cycles per scanline
+
 // LCD Mode
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum LcdMode {
-    HBlank = 0,		// Horizontal blanking (mode 0)
-    VBlank = 1,		// Vertical blanking (mode 1)
-    OamScan = 2,	// OAM RAM access (mode 2)
-    Drawing = 3,	// Pixel transfer (mode 3)
+    HBlank = 0,     // Horizontal blanking (mode 0)
+    VBlank = 1,     // Vertical blanking (mode 1)
+    OamScan = 2,    // OAM RAM access (mode 2)
+    Drawing = 3,    // Pixel transfer (mode 3)
+}
+
+#[derive(Clone, Copy, Debug)]
+enum Palette {
+    BGP,
+    OBP0,
+    OBP1,
 }
 
 // OAM Entry (Sprite Attributes)
@@ -88,71 +95,92 @@ impl OamEntry {
     }
 }
 
+// Background-to-OAM Priority
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum BgOamPrio {
+    OAMPrio,  // OAM has priority over background
+    BGPrio,   // Background has priority over OAM
+}
+
+// Pixel color with priority information
+#[derive(Clone, Copy, Debug)]
+pub struct PixelData {
+    pub color_idx: u8,             // Original color index (0-3)
+    pub color: u8,                 // Final color after palette mapping
+    pub priority: BgOamPrio,       // BG-to-OAM priority
+}
+
 pub struct Ppu {
-	pub frame_buffer: [u8; SCREEN_WIDTH * SCREEN_HEIGHT * 4], // RGBA
-	// VRMA
-	vram: [u8; 0x2000],
-	// OAM
-	oam: [u8; 0xA0],
+    frame_buffer: [u8; SCREEN_WIDTH * SCREEN_HEIGHT * 4], // RGBA
+    pub ui_frame_buffer: [u8; SCREEN_WIDTH * SCREEN_HEIGHT * 4],
+    // VRAM
+    vram: [u8; 0x2000],
+    // OAM
+    oam: [u8; 0xA0],
     // Parsed OAM entries for quick access
     pub oam_entries: [OamEntry; 40],
     // Current scanline sprites (max 10 per line)
     scanline_sprites: Vec<(usize, OamEntry)>, // (index, entry) pairs
-	// LCD Registers
-	pub lcdc: u8,
-	pub stat: u8,
-	pub scy: u8,
-	pub scx: u8,
-	pub ly: u8,
-	pub lyc: u8,
-	pub dma: u8,
-	pub bgp: u8,
-	pub obp0: u8,
-	pub obp1: u8,
-	pub wy: u8,
-    wy_triggered: bool,
-	pub wx: u8,
+    // Scanline data
+    scanline_data: Vec<PixelData>,
+    
+    // LCD Registers
+    pub lcdc: u8,
+    pub stat: u8,
+    pub scy: u8,
+    pub scx: u8,
+    latched_scx: u8,
+    latched_scy: u8,
+    pub ly: u8,
+    pub lyc: u8,
+    pub dma: u8,
+    pub bgp: u8,
+    pub obp0: u8,
+    pub obp1: u8,
+    pub wy: u8,
+    pub wx: u8,
 
     // Window internal position counter
-    window_line: u8, // Current line in the window, separate from LY
+    window_line: u8,        // Current line in the window, separate from LY
+    window_triggered: bool, // Window was triggered this frame
+    window_active: bool,    // Window rendering is active
 
-	// PPU Mode
-	mode: LcdMode,
-	mode_cycles: u32,
+    // PPU Mode
+    mode: LcdMode,
+    cycle_count: u32,     // Cycles within the current scanline
+    
+    // STAT interrupt edge detection
+    prev_stat_signal: bool,
 
     // Access control flags
     vram_accessible: bool,
     oam_accessible: bool,
 
-	// For tracking when the frame is ready
-	pub frame_ready: bool,
-
-    // For tracking OAM Corruption
+    // For tracking OAM DMA
     pub oam_dma_active: bool,
-    oam_dma_byte: u8,
-    last_frame_window_active: bool,
-    
-    // LY=LYC interrupt already triggered for this line
-    lyc_interrupt_triggered: bool,
-    
-    // CPU last read/write a locked area
-    cpu_vram_bus_conflict: bool,
-    cpu_oam_bus_conflict: bool,
+    pub oam_dma_byte: u8,
+    pub oam_dma_source: u16,
+    frame_swapped: bool,
 }
 
 impl Ppu {
-	pub fn new() -> Self {
-		let mut ppu = Self {
-			frame_buffer: [0xFF; SCREEN_WIDTH * SCREEN_HEIGHT * 4], // Initialize with white
-			vram: [0; 0x2000],
-			oam: [0; 0xA0],
+    pub fn new() -> Self {
+        let mut ppu = Self {
+            frame_buffer: [0xFF; SCREEN_WIDTH * SCREEN_HEIGHT * 4], // Initialize with white
+            ui_frame_buffer: [0xFF; SCREEN_WIDTH * SCREEN_HEIGHT * 4],
+            vram: [0; 0x2000],
+            oam: [0; 0xA0],
             oam_entries: [OamEntry::new(); 40],
             scanline_sprites: Vec::with_capacity(10),
-			lcdc: 0x91, // LCD & PPU are on by default
-			stat: 0x85, // Set STAT to mode 2
-			scy: 0,
-			scx: 0,
-			ly: 0,
+            scanline_data: Vec::with_capacity(256),
+            
+            lcdc: 0x91, // LCD & PPU are on by default
+            stat: 0x85,
+            scy: 0,
+            scx: 0,
+            latched_scx: 0,
+            latched_scy: 0,
+            ly: 0,
             lyc: 0,
             dma: 0xFF,
             bgp: 0xFC,
@@ -160,24 +188,29 @@ impl Ppu {
             obp1: 0xFF,
             wy: 0,
             wx: 0,
-            wy_triggered: false,
+            
             window_line: 0,
+            window_triggered: false,
+            window_active: false,
+            
             mode: LcdMode::VBlank,
-            mode_cycles: 0,
+            cycle_count: 0,
+            
+            prev_stat_signal: false,
+            
             vram_accessible: true,
             oam_accessible: true,
-            frame_ready: false,
+            
             oam_dma_active: false,
             oam_dma_byte: 0,
-            last_frame_window_active: false,
-            lyc_interrupt_triggered: false,
-            cpu_vram_bus_conflict: false,
-            cpu_oam_bus_conflict: false,
-		};
+            oam_dma_source: 0,
+            frame_swapped: false,
+        };
+        
         // Initialize OAM entries from initial OAM data
         ppu.update_oam_entries();
         ppu
-	}
+    }
 
     // Update OAM entries from raw OAM data
     fn update_oam_entries(&mut self) {
@@ -189,9 +222,10 @@ impl Ppu {
         }
     }
 
-	// Read from VRAM
+    // Read from VRAM
     pub fn read_vram(&self, addr: u16) -> u8 {
-        if !self.vram_accessible && self.lcdc & 0x80 != 0 {
+        if !self.vram_accessible && self.is_lcd_on() {
+            // VRAM is inaccessible during certain modes when LCD is on
             return 0xFF;
         }
         self.vram[(addr - 0x8000) as usize]
@@ -199,51 +233,13 @@ impl Ppu {
 
     // Write to VRAM
     pub fn write_vram(&mut self, addr: u16, value: u8) {
-        if !self.vram_accessible && self.lcdc & 0x80 != 0 {
-            self.cpu_vram_bus_conflict = true;
+        if !self.vram_accessible && self.is_lcd_on() {
+            // VRAM is inaccessible during certain modes when LCD is on
             return;
         }
         self.vram[(addr - 0x8000) as usize] = value;
     }
 
-    pub fn get_dma_source(&self) -> u16 {
-        (self.dma as u16) << 8
-    }
-    
-    pub fn get_dma_byte(&self) -> u8 {
-        self.oam_dma_byte
-    }
-    
-    pub fn process_dma_byte(&mut self, value: u8) {
-        if !self.oam_dma_active {
-            return;
-        }
-        
-        // Write to OAM directly (bypassing access check)
-        self.oam[self.oam_dma_byte as usize] = value;
-        
-        // Update OAM entry if it's a 4-byte boundary
-        if self.oam_dma_byte % 4 == 3 {
-            let entry_idx = (self.oam_dma_byte / 4) as usize;
-            if entry_idx < 40 {  // Safety check
-                let start = entry_idx * 4;
-                let mut bytes = [0u8; 4];
-                bytes.copy_from_slice(&self.oam[start..start + 4]);
-                self.oam_entries[entry_idx] = OamEntry::from_bytes(&bytes);
-            }
-        }
-        
-        self.oam_dma_byte += 1;
-        
-        // Check if DMA is complete
-        if self.oam_dma_byte >= 160 {
-            self.oam_dma_active = false;
-            self.oam_dma_byte = 0;
-            // Update all OAM entries after DMA completes
-            self.update_oam_entries();
-        }
-    }
-    
     // Read from OAM
     pub fn read_oam(&self, addr: u16) -> u8 {
         let oam_addr = (addr - 0xFE00) as usize;
@@ -252,17 +248,15 @@ impl Ppu {
         }
         
         // Check if OAM is accessible based on the current mode
-        if !self.oam_accessible {
-            if self.lcdc & 0x80 != 0 { // LCD enabled
-                // During modes 2 & 3 (OAM scan & pixel transfer), OAM is inaccessible
-                return 0xFF;
-            }
+        if !self.oam_accessible && self.is_lcd_on() {
+            // OAM is inaccessible during certain modes when LCD is on
+            return 0xFF;
         }
         
         // Simulate OAM corruption during DMA
         if self.oam_dma_active {
-            // OAM corruption - complex bug, simplified simulation 
-            return 0xFF; // Corrupted read during DMA
+            // Return 0xFF during DMA (simplified, actual behavior is more complex)
+            return 0xFF;
         }
         
         self.oam[oam_addr]
@@ -276,45 +270,53 @@ impl Ppu {
         }
         
         // Check if OAM is accessible based on the current mode
-        if !self.oam_accessible && self.lcdc & 0x80 != 0 {
-            self.cpu_oam_bus_conflict = true;
+        if !self.oam_accessible && self.is_lcd_on() {
+            // OAM is inaccessible during certain modes when LCD is on
             return;
         }
         
-        // Simulate OAM corruption during DMA
+        // OAM is inaccessible during DMA
         if self.oam_dma_active {
-            // OAM is locked during DMA
             return;
         }
         
-        self.oam[oam_addr] = value;
+        self.write_oam_internal(addr - 0xFE00, value);
+    }
+    
+    // Internal method to write to OAM without access checks
+    pub fn write_oam_internal(&mut self, oam_addr: u16, value: u8) {
+        self.oam[oam_addr as usize] = value;
         
         // Update the corresponding OAM entry
-        let entry_idx = oam_addr / 4;
-        let byte_idx = oam_addr % 4;
-        
-        match byte_idx {
-            0 => self.oam_entries[entry_idx].y_pos = value,
-            1 => self.oam_entries[entry_idx].x_pos = value,
-            2 => self.oam_entries[entry_idx].tile_idx = value,
-            3 => self.oam_entries[entry_idx].attributes = value,
-            _ => unreachable!(),
+        let entry_idx = (oam_addr / 4) as usize;
+        if entry_idx < 40 {
+            let byte_idx = oam_addr % 4;
+            
+            match byte_idx {
+                0 => self.oam_entries[entry_idx].y_pos = value,
+                1 => self.oam_entries[entry_idx].x_pos = value,
+                2 => self.oam_entries[entry_idx].tile_idx = value,
+                3 => self.oam_entries[entry_idx].attributes = value,
+                _ => unreachable!(),
+            }
         }
     }
     
     // Begin DMA transfer
-    fn begin_oam_dma(&mut self, value: u8) {
+    pub fn begin_oam_dma(&mut self, value: u8) {
         self.dma = value;
         self.oam_dma_active = true;
         self.oam_dma_byte = 0;
+        self.oam_dma_source = (value as u16) << 8; // Source address is value * 0x100
     }
 
-	// Read from a PPU register
+    // Read from a PPU register
     pub fn read_register(&self, addr: u16) -> u8 {
         match addr {
             LCDC => self.lcdc,
             STAT => {
                 // Combine STAT register with current mode
+                // Bits 0-1: Mode, Bit 2: LY=LYC flag, Bits 3-6: Interrupt sources, Bit 7: Always 1
                 let mode_bits = self.mode as u8;
                 let lyc_flag = if self.ly == self.lyc { 0x04 } else { 0x00 };
                 0x80 | (self.stat & 0x78) | lyc_flag | mode_bits
@@ -329,7 +331,7 @@ impl Ppu {
             OBP1 => self.obp1,
             WY => self.wy,
             WX => self.wx,
-            _ => 0xFF, // Should not happen
+            _ => 0xFF, // Invalid address
         }
     }
     
@@ -337,64 +339,54 @@ impl Ppu {
     pub fn write_register(&mut self, addr: u16, value: u8) {
         match addr {
             LCDC => {
-                let old_lcd_enable = self.lcdc & 0x80 != 0;
-                let new_lcd_enable = value & 0x80 != 0;
-                
-                // Store the old value to detect changes
-                let old_lcdc = self.lcdc;
+                let old_lcd_enabled = self.is_lcd_on();
                 self.lcdc = value;
                 
-                // Turning LCD off
-                if old_lcd_enable && !new_lcd_enable {
-                    self.ly = 0;
-                    self.mode = LcdMode::HBlank;
-                    self.mode_cycles = 0;
-                    self.vram_accessible = true;
-                    self.oam_accessible = true;
-                    self.window_line = 0;
-                } else if !old_lcd_enable && new_lcd_enable {
-                    // LCD turned on - initialize state
-                    self.mode_cycles = 0;
-                    self.mode = LcdMode::OamScan;
+                // Handle LCD being turned off
+                if old_lcd_enabled && !self.is_lcd_on() {
+                    self.turn_lcd_off();
                 }
-                
-                // Handle window enable/disable
-                if (old_lcdc & 0x20) != (value & 0x20) {
-                    // Window was toggled, make sure state is consistent
-                    if value & 0x20 == 0 {
-                        // Window disabled mid-frame
-                        // Don't reset window_line here!
+                // When LCD is turned on, reset PPU state
+                else if !old_lcd_enabled && self.is_lcd_on() {
+                    self.cycle_count = 0;
+                    self.mode = LcdMode::OamScan;
+                    
+                    // Update STAT mode and LY=LYC comparison
+                    self.stat &= !0x03;  // Clear mode bits
+                    self.stat |= LcdMode::OamScan as u8; // Set mode 2
+                    
+                    // Check LY=LYC
+                    if self.ly == self.lyc {
+                        self.stat |= 0x04; // Set coincidence flag
+                    } else {
+                        self.stat &= !0x04; // Clear coincidence flag
                     }
                 }
             },
             STAT => {
                 // Only bits 3-6 are writable, bit 7 always reads as 1
-                let old_stat = self.stat;
-                self.stat = 0x80 | (value & 0x78) | (self.stat & 0x07);
+                self.stat = (value & 0x78) | (self.stat & 0x07) | 0x80;
                 
-                // Check if LYC=LY interrupt was just enabled and condition is true
-                if (old_stat & 0x40) == 0 && (value & 0x40) != 0 && (self.stat & 0x04) != 0 {
-                    self.lyc_interrupt_triggered = true;
-                }
+                // Check if this causes a STAT interrupt
+                self.check_stat_interrupt();
             },
             SCY => self.scy = value,
             SCX => self.scx = value,
             LY => {}, // LY is read-only
             LYC => {
-                let old_lyc = self.lyc;
                 self.lyc = value;
                 
-                // Update coincidence flag immediately
-                if self.ly == value {
-                    self.stat |= 0x04; // Set coincidence flag
-                    
-                    // If coincidence interrupt enabled and LYC changed to match LY
-                    if (self.stat & 0x40) != 0 && old_lyc != value {
-                        self.lyc_interrupt_triggered = true;
+                // Update LY=LYC flag immediately if LCD is on
+                if self.is_lcd_on() {
+                    if self.ly == self.lyc {
+                        self.stat |= 0x04; // Set coincidence flag
+                    } else {
+                        self.stat &= !0x04; // Clear coincidence flag
                     }
-                } else {
-                    self.stat &= !0x04; // Clear coincidence flag
                 }
+                
+                // Check if this causes a STAT interrupt
+                self.check_stat_interrupt();
             },
             DMA => self.begin_oam_dma(value),
             BGP => self.bgp = value,
@@ -402,606 +394,620 @@ impl Ppu {
             OBP1 => self.obp1 = value,
             WY => self.wy = value,
             WX => self.wx = value,
-            _ => {}, // Should not happen
+            _ => {}, // Invalid address
         }
     }
 
-    #[allow(dead_code)]
-    fn debugging(&self) {
-        println!("");
-        println!("LCDC: {:#04X}", self.lcdc);
-        println!("STAT: {:#04X}", self.stat);
-        println!("SCY: {:#04X}", self.scy);
-        println!("SCX: {:#04X}", self.scx);
-        println!("LY: {:#04X}", self.ly);
-        println!("LYC: {:#04X}", self.lyc);
-        println!("BGP: {:#04X}", self.bgp);
-        println!("OBP0: {:#04X}", self.obp0);
-        println!("OBP1: {:#04X}", self.obp1);
-        println!("WY: {:#04X}", self.wy);
-        println!("WX: {:#04X}", self.wx);
-        println!("Window Line: {:#04X}", self.window_line);
-        println!("MODE: {:?}", self.mode);
-        println!("MODE CYCLES: {}", self.mode_cycles);
-    }
-
-	// Update the PPU for the specified number of cycles
+    // Update the PPU state for one T-cycle
     pub fn update_cycle(&mut self) -> Option<InterruptType> {
-        // Skip if LCD is off
-        if self.lcdc & 0x80 == 0 {
+        // Skip all processing if LCD is off
+        if !self.is_lcd_on() {
             return None;
         }
+
+        // Latch scroll registers at the beginning of each scanline
+    if self.cycle_count == 0 {
+        self.latched_scx = self.scx;
+        self.latched_scy = self.scy;
+    }
         
-        // Store old state for edge detection
-        let old_mode = self.mode;
-        let old_ly = self.ly;
-        
-        // Initialize interrupt to None
         let mut interrupt = None;
         
-        // Add cycles to mode counter
-        self.mode_cycles += 1;
-        
-        // PPU state machine
+        // Process the current PPU state based on mode
         match self.mode {
-            LcdMode::OamScan => { // Mode 2
-                // OAM scan mode - OAM locked, VRAM accessible
+            LcdMode::OamScan => {
+                // OAM not accessible during OAM scan
                 self.oam_accessible = false;
                 self.vram_accessible = true;
                 
-                // Check WY condition at the start of Mode 2 (OAM Scan)
-                if self.ly == self.wy && (self.lcdc & 0x20) != 0 {
-                    self.wy_triggered = true;
-                    self.last_frame_window_active = true;
-                }
-                
-                // Mode 2 (OAM scan) takes 80 cycles
-                if self.mode_cycles >= 80 {
-                    // Move to Mode 3 (Drawing)
-                    self.mode = LcdMode::Drawing;
-                    self.mode_cycles -= 80;
-                    self.vram_accessible = false;
+                // End of OAM scan - prepare sprites and transition to Drawing mode
+                if self.cycle_count == MODE2_CYCLES {
+                    // Find sprites on the current scanline
+                    if self.scanline_sprites.is_empty() {
+                        self.prepare_sprites_for_scanline();
+                    }
                     
-                    // Prepare sprites for this scanline
-                    self.prepare_sprites_for_scanline();
+                    // Transition to Drawing mode
+                    self.change_mode(LcdMode::Drawing);
+                    self.vram_accessible = false; // VRAM not accessible during Drawing
                 }
             },
             
-            LcdMode::Drawing => { // Mode 3
-                // Drawing mode - both OAM and VRAM locked
+            LcdMode::Drawing => {
+                // Both OAM and VRAM inaccessible during Drawing
                 self.oam_accessible = false;
                 self.vram_accessible = false;
                 
-                // Calculate Mode 3 length based on sprites
+                // Calculate Mode 3 duration (it can vary based on sprite count)
                 let sprite_penalty = (self.scanline_sprites.len() as u32 * 6).min(60);
-                let drawing_time = 172 + sprite_penalty;
+                let mode3_duration = MODE3_CYCLES + sprite_penalty;
                 
-                if self.mode_cycles >= drawing_time {
-                    // Move to Mode 0 (HBlank)
-                    self.mode = LcdMode::HBlank;
-                    self.mode_cycles -= drawing_time;
-                    self.vram_accessible = true;
-                    self.oam_accessible = true;
-                    
-                    // Render this scanline
-                    self.render_scanline();
-                    
-                    // Update window line counter after rendering
-                    if self.wy_triggered && self.ly >= self.wy {
-                        self.window_line = self.window_line.wrapping_add(1);
+                // End of Drawing - render scanline and transition to HBlank
+                if self.cycle_count == MODE2_CYCLES + mode3_duration {
+                    // Render the current scanline
+                    if self.scanline_data.is_empty() {
+                        self.render_scanline();
                     }
+                    
+                    // Check for window activation during this line
+                    if self.is_window_enabled() && self.ly >= self.wy && self.wx <= 166 {
+                        self.window_triggered = true;
+                        if self.window_active {
+                            self.window_line += 1;
+                        } else {
+                            self.window_active = true;
+                        }
+                    }
+                    
+                    // Transition to HBlank mode
+                    self.change_mode(LcdMode::HBlank);
+                    self.vram_accessible = true;  // VRAM accessible during HBlank
+                    self.oam_accessible = true;   // OAM accessible during HBlank
                 }
             },
             
-            LcdMode::HBlank => { // Mode 0
-                // HBlank mode - both OAM and VRAM accessible
+            LcdMode::HBlank => {
+                // Both OAM and VRAM accessible during HBlank
                 self.oam_accessible = true;
                 self.vram_accessible = true;
                 
-                // Calculate HBlank duration
-                let sprite_penalty = (self.scanline_sprites.len() as u32 * 6).min(60);
-                let hblank_time = 456 - (80 + 172 + sprite_penalty);
-                
-                if self.mode_cycles >= hblank_time {
-                    self.mode_cycles -= hblank_time;
+                // End of scanline
+                if self.cycle_count == LINE_CYCLES {
+                    // Reset cycle count and process the next line
+                    self.cycle_count = 0;
+                    self.ly += 1;
                     
-                    // Increment LY
-                    self.ly = (self.ly + 1) % 154;
-                    
-                    // Check window activation on LY change
-                    if self.ly == self.wy && (self.lcdc & 0x20) != 0 {
-                        self.wy_triggered = true;
-                        self.last_frame_window_active = true;
-                    }
-                    
-                    // Check if we've reached the end of visible screen
+                    // Check if we're at the VBlank boundary
                     if self.ly == 144 {
-                        // Enter VBlank (Mode 1)
-                        self.mode = LcdMode::VBlank;
-                        self.frame_ready = true;
-                        
-                        // VBlank interrupt is always generated
+                        // Enter VBlank mode
+                        self.change_mode(LcdMode::VBlank);
+                        std::mem::swap(&mut self.frame_buffer, &mut self.ui_frame_buffer);
+                        self.frame_swapped = true;
                         interrupt = Some(InterruptType::VBlank);
                     } else {
-                        // Start next scanline with OAM scan (Mode 2)
-                        self.mode = LcdMode::OamScan;
+                        // Start the next scanline
+                        self.change_mode(LcdMode::OamScan);
+                        self.oam_accessible = false; // OAM scan begins immediately
                     }
+                    
+                    // Clear scanline buffers for the next line
+                    self.scanline_sprites.clear();
+                    self.scanline_data.clear();
+                    
+                    // Update LY=LYC flag for the new LY value
+                    if self.ly == self.lyc {
+                        self.stat |= 0x04; // Set coincidence flag
+                    } else {
+                        self.stat &= !0x04; // Clear coincidence flag
+                    }
+                    
+                    // Check if this causes a STAT interrupt
+                    if self.check_stat_interrupt() && interrupt.is_none() {
+                        interrupt = Some(InterruptType::LcdStat);
+                    }
+                    
+                    return interrupt; // Return early to avoid incrementing cycle_count again
                 }
             },
             
-            LcdMode::VBlank => { // Mode 1
-                // VBlank mode - both OAM and VRAM accessible
+            LcdMode::VBlank => {
+                // Both OAM and VRAM accessible during VBlank
                 self.oam_accessible = true;
                 self.vram_accessible = true;
                 
-                // Each scanline in VBlank still takes 456 cycles
-                if self.mode_cycles >= 456 {
-                    self.mode_cycles -= 456;
+                // End of scanline during VBlank
+                if self.cycle_count == LINE_CYCLES {
+                    // Reset cycle count
+                    self.cycle_count = 0;
+                    self.ly += 1;
                     
-                    // Increment LY
-                    self.ly = (self.ly + 1) % 154;
-                    
-                    // Check for end of VBlank
-                    if self.ly == 0 {
-                        // Always reset window line counter at frame start
+                    // Check if we've reached the end of VBlank
+                    if self.ly == 154 {
+                        // Start a new frame
+                        self.ly = 0;
                         self.window_line = 0;
-                        self.last_frame_window_active = false;
-                        self.wy_triggered = false;
+                        self.window_active = false;
+                        self.window_triggered = false;
                         
-                        // Start new frame with OAM scan (Mode 2)
-                        self.mode = LcdMode::OamScan;
+                        // Transition to OAM scan for the first line
+                        self.change_mode(LcdMode::OamScan);
+                        self.oam_accessible = false; // OAM scan begins immediately
                     }
+                    
+                    // Update LY=LYC flag for the new LY value
+                    if self.ly == self.lyc {
+                        self.stat |= 0x04; // Set coincidence flag
+                    } else {
+                        self.stat &= !0x04; // Clear coincidence flag
+                    }
+                    
+                    // Check if this causes a STAT interrupt
+                    if self.check_stat_interrupt() {
+                        interrupt = Some(InterruptType::LcdStat);
+                    }
+                    
+                    return interrupt; // Return early to avoid incrementing cycle_count again
                 }
             },
         }
         
-        // Update STAT register with current mode
-        let mode_bits = self.mode as u8;
-        self.stat = (self.stat & 0xFC) | (mode_bits & 0x3);
+        // Increment the cycle count
+        self.cycle_count += 1;
         
         interrupt
     }
 
-    // Prepare sprites for the current scanline (OAM scan)
+    // Check if a STAT interrupt should be triggered (rising edge detection)
+    fn check_stat_interrupt(&mut self) -> bool {
+        // Calculate STAT interrupt signal based on current state
+        let lyc_int = (self.stat & 0x40) != 0 && (self.stat & 0x04) != 0;
+        let mode_0_int = (self.stat & 0x08) != 0 && self.mode == LcdMode::HBlank;
+        let mode_1_int = (self.stat & 0x10) != 0 && self.mode == LcdMode::VBlank;
+        let mode_2_int = (self.stat & 0x20) != 0 && self.mode == LcdMode::OamScan;
+        
+        let stat_signal = lyc_int || mode_0_int || mode_1_int || mode_2_int;
+        
+        // Detect rising edge (0 -> 1 transition)
+        let triggered = !self.prev_stat_signal && stat_signal;
+        self.prev_stat_signal = stat_signal;
+        
+        triggered
+    }
+
+    // Change the PPU mode and update STAT register
+    fn change_mode(&mut self, new_mode: LcdMode) {
+        if self.mode != new_mode {
+            // Update the mode bits in STAT register
+            self.stat &= !0x03; // Clear mode bits
+            self.stat |= new_mode as u8; // Set new mode
+            
+            // Update internal mode
+            self.mode = new_mode;
+        }
+    }
+
+    // Turn the LCD off (LCDC bit 7 = 0)
+    fn turn_lcd_off(&mut self) {
+        // Reset PPU state when LCD is turned off
+        self.ly = 0;
+        self.window_line = 0;
+        self.window_active = false;
+        self.window_triggered = false;
+        
+        self.cycle_count = 0;
+        self.mode = LcdMode::HBlank;
+        
+        // Set mode to 0 in STAT register
+        self.stat &= !0x03;
+        
+        // Make VRAM and OAM accessible
+        self.vram_accessible = true;
+        self.oam_accessible = true;
+    }
+
+    // Prepare sprites for the current scanline
     fn prepare_sprites_for_scanline(&mut self) {
         self.scanline_sprites.clear();
         
-        // If objects are disabled, don't collect any sprites
-        if self.lcdc & 0x02 == 0 {
+        // Skip if sprites are disabled
+        if !self.is_obj_enabled() {
             return;
         }
         
-        // Determine sprite size based on LCDC bit 2
-        let sprite_size = if self.lcdc & 0x04 != 0 { 16 } else { 8 };
+        // Determine sprite size (8x8 or 8x16)
+        let sprite_size = if self.is_sprite_8x16() { 16 } else { 8 };
         
-        // First pass: collect all sprites visible on this scanline
+        // Collect all sprites that are visible on this scanline
         for (idx, sprite) in self.oam_entries.iter().enumerate() {
-            // Check if sprite is on the current scanline
             if sprite.is_on_scanline(self.ly, sprite_size) {
-                // Include all sprites in range, even those with X=0
-                // They count toward the 10 sprite limit even if not rendered
                 self.scanline_sprites.push((idx, *sprite));
             }
         }
         
-        // Sort sprites according to DMG priority rules:
-        // 1. Lower X-coordinate has higher priority
-        // 2. If X-coordinates are equal, lower OAM index has higher priority
+        // Sort sprites by X-coordinate (lower X has priority)
+        // If X coordinates are equal, lower OAM index has priority
         self.scanline_sprites.sort_by(|(idx_a, sprite_a), (idx_b, sprite_b)| {
             sprite_a.x_pos.cmp(&sprite_b.x_pos)
                 .then_with(|| idx_a.cmp(idx_b))
         });
         
-        // Limit to 10 sprites per scanline (DMG hardware limitation)
+        // Limit to 10 sprites per scanline (hardware limitation)
         if self.scanline_sprites.len() > 10 {
             self.scanline_sprites.truncate(10);
         }
         
-        // Reverse the array so we can process from highest priority to lowest
-        // This makes the rendering code cleaner as earlier sprites overwrite later ones
+        // Reverse to process from highest to lowest priority
         self.scanline_sprites.reverse();
     }
 
-	// Render a single scanline to the frame buffer
+    // Render the current scanline
     fn render_scanline(&mut self) {
-        // Only render if LCD is enabled
-        if self.lcdc & 0x80 == 0 {
-            return;
+        // Clear the scanline buffer
+        self.scanline_data.clear();
+        self.scanline_data.resize(256, PixelData {
+            color_idx: 0,
+            color: self.get_dmg_color(0, Palette::BGP),
+            priority: BgOamPrio::BGPrio,
+        });
+        
+        // Render background if enabled
+        if self.is_bg_enabled() {
+            self.render_background();
         }
         
-        // Create a scanline buffer for priority handling
-        let mut scanline_buffer = [(0u8, false); SCREEN_WIDTH];
-        
-        // Background
-        if self.lcdc & 0x01 != 0 { // BG enabled
-            self.render_background(&mut scanline_buffer);
-        } else {
-            // If background is disabled, fill with color 0
-            for x in 0..SCREEN_WIDTH {
-                scanline_buffer[x] = (0, false);
-            }
+        // Render window if enabled and visible
+        if self.is_window_enabled() && self.window_active && self.is_window_visible() {
+            self.render_window();
         }
         
-        // Window
-        /*if self.lcdc & 0x20 != 0 { // Window enabled
-            self.render_window(&mut scanline_buffer);
-        }*/
-
-        if self.lcdc & 0x20 != 0 && self.last_frame_window_active { // Window enabled
-            self.render_window(&mut scanline_buffer);
+        // Render sprites if enabled
+        if self.is_obj_enabled() {
+            self.render_sprites();
         }
         
-        // Sprites
-        if self.lcdc & 0x02 != 0 { // Sprites enabled
-            self.render_sprites(&mut scanline_buffer);
-        }
-        
-        // Now transfer scanline buffer to frame buffer
-        self.finalize_scanline(&scanline_buffer);
+        // Transfer the scanline to the frame buffer
+        self.draw_scanline_to_frame_buffer();
     }
 
-	// Render the background for the current scanline
-    fn render_background(&mut self, scanline_buffer: &mut [(u8, bool)]) {
-        // Get tile map address based on LCDC bit 3
-        let tile_map_addr = if self.lcdc & 0x08 != 0 { 0x9C00 } else { 0x9800 };
+    // Render the background layer
+    fn render_background(&mut self) {
+        // The correct tile map address based on LCDC bit 3
+        // LCDC bit 3 (value 0x08) determines which background tile map to use
+        let bg_tile_map = if (self.lcdc & 0x08) == 0 { 0x9800 } else { 0x9C00 };
         
-        // Get tile data address based on LCDC bit 4
-        let tile_data_signed = self.lcdc & 0x10 == 0;
-        let tile_data_addr = if !tile_data_signed { 0x8000 } else { 0x8800 };
+        // Use the latched scroll values for the entire scanline
+        let y = self.latched_scy.wrapping_add(self.ly);
+        let tile_row = (y / 8) as u16; // Which row of tiles
+        let tile_y = y % 8;           // Which line within the tile
         
-        // Calculate y position within background
-        let y_pos = (self.ly.wrapping_add(self.scy)) & 0xFF;
-        
-        // Calculate which tile row we're on
-        let tile_row = (y_pos / 8) as u16;
-        
-        // Calculate which pixel row within the tile
-        let tile_y = (y_pos % 8) as u16;
+        // Determine the tile data addressing mode from LCDC bit 4
+        let unsigned_addressing = (self.lcdc & 0x10) != 0;
         
         // For each pixel in the scanline
-        for x in 0..SCREEN_WIDTH {
-            // Calculate x position within background
-            let x_pos = (x as u8).wrapping_add(self.scx);
+        for x in 0..256 {
+            // Calculate X position within background map with correct wrapping
+            let bg_x = (self.latched_scx as u16 + x as u16) & 0xFF;
+            let tile_col = (bg_x / 8) as u16;
+            let tile_x = bg_x % 8;
             
-            // Calculate which tile column we're on
-            let tile_col = (x_pos / 8) as u16;
+            // Get the right tile from the map
+            // Background maps are 32x32 tiles, so wrap at 32
+            let map_idx = ((tile_row & 0x1F) * 32 + (tile_col & 0x1F)) as usize;
+            let tile_map_addr = (bg_tile_map - 0x8000) + map_idx;
             
-            // Calculate which pixel column within the tile
-            let tile_x = (x_pos % 8) as u16;
+            // Safety check to prevent out-of-bounds access
+            if tile_map_addr >= self.vram.len() {
+                continue;
+            }
             
-            // Calculate tile index address in the tile map
-            let tile_map_index = tile_map_addr + tile_row * 32 + tile_col;
+            // Get the tile index from the background map
+            let tile_idx = self.vram[tile_map_addr];
             
-            // Get the tile index from the tile map
-            let tile_index = self.read_vram(tile_map_index);
-            
-            // Calculate tile data address
-            let tile_data_index = if !tile_data_signed {
-                tile_data_addr + (tile_index as u16) * 16
+            // Get tile data address based on addressing mode
+            let tile_data_addr = if unsigned_addressing {
+                // 8000 addressing mode (unsigned)
+                0x8000 + (tile_idx as u16 * 16)
             } else {
-                tile_data_addr + ((tile_index as i8 as i16 + 128) as u16) * 16
+                // 8800 addressing mode (signed)
+                if tile_idx < 128 {
+                    0x9000 + (tile_idx as u16 * 16)
+                } else {
+                    0x8800 + ((tile_idx - 128) as u16 * 16)
+                }
             };
             
-            // Read the two bytes of tile data for this row
-            let tile_data_low = self.read_vram(tile_data_index + tile_y * 2);
-            let tile_data_high = self.read_vram(tile_data_index + tile_y * 2 + 1);
+            // Calculate the specific row address within the tile
+            let row_addr = tile_data_addr + (tile_y as u16 * 2);
             
-            // Calculate the bit position within the tile data
-            let bit_pos = 7 - tile_x;
+            // Read the two bytes that define this row of the tile
+            let low_byte_addr = (row_addr - 0x8000) as usize;
+            let high_byte_addr = low_byte_addr + 1;
             
-            // Get the pixel color (2 bits, one from each byte)
-            let color_bit_low = (tile_data_low >> bit_pos) & 0x01;
-            let color_bit_high = (tile_data_high >> bit_pos) & 0x01;
-            let color_idx = (color_bit_high << 1) | color_bit_low;
+            // Safety check again
+            if high_byte_addr >= self.vram.len() {
+                continue;
+            }
             
-            // Map to real color from the palette
-            let color = self.get_color(color_idx, self.bgp);
+            let low_byte = self.vram[low_byte_addr];
+            let high_byte = self.vram[high_byte_addr];
             
-            // Store in the scanline buffer - mark as non-zero if color_idx > 0
-            scanline_buffer[x] = (color, color_idx > 0);
+            // Get the bit for this specific pixel
+            let bit_pos = 7 - (tile_x as u8);
+            let low_bit = (low_byte >> bit_pos) & 1;
+            let high_bit = (high_byte >> bit_pos) & 1;
+            let color_idx = (high_bit << 1) | low_bit;
+            
+            // Set the pixel in the scanline buffer (if within bounds)
+            if x < self.scanline_data.len() {
+                self.scanline_data[x] = PixelData {
+                    color_idx,
+                    color: self.get_dmg_color(color_idx, Palette::BGP),
+                    priority: BgOamPrio::BGPrio,
+                };
+            }
         }
     }
-    
-    // Render the window for the current scanline
-    /*fn render_window(&mut self, scanline_buffer: &mut [(u8, bool)]) {
-        // Check if window is disabled by LCDC bit 5
-        if self.lcdc & 0x20 == 0 {
-            return;
-        }
-        
-        // In DMG mode, window is also disabled if BG is disabled (LCDC bit 0)
-        if self.lcdc & 0x01 == 0 {
-            return;
-        }
-        
-        // Check if WY condition was triggered for this frame
-        if !self.wy_triggered {
-            return;
-        }
-        
-        // Check if window X position is valid
-        // WX=7 puts the window at the left edge of the screen
-        // WX>=167 means window is not visible on this scanline
+
+    // Render the window layer
+    fn render_window(&mut self) {
+        // Only render if window is visible at current scanline
         if self.wx > 166 {
             return;
         }
         
-        // Get window tile map address based on LCDC bit 6
-        let tile_map_addr = if self.lcdc & 0x40 != 0 { 0x9C00 } else { 0x9800 };
+        // Get window map area
+        let win_tile_map = if self.lcdc & 0x40 == 0 { 0x9800 } else { 0x9C00 };
         
-        // Get tile data address based on LCDC bit 4
-        let tile_data_signed = self.lcdc & 0x10 == 0;
-        let tile_data_addr = if !tile_data_signed { 0x8000 } else { 0x8800 };
+        // Calculate Y position within window
+        let win_y = self.window_line;
+        let tile_row = (win_y / 8) as u16;
+        let tile_y = win_y % 8;
         
-        // Use internal window line counter
-        let window_y = self.window_line;
+        // Calculate window X position (WX-7 is actually the left edge of the window)
+        let win_x_start = if self.wx < 7 { 0 } else { (self.wx as i16 - 7) as usize };
         
-        // Calculate which tile row we're on
-        let tile_row = (window_y / 8) as u16;
-        
-        // Calculate which pixel row within the tile
-        let tile_y = (window_y % 8) as u16;
-        
-        // Flag to track if we actually rendered any window pixels
-        let mut rendered = false;
-        
-        // For each pixel in the scanline
-        for x in 0..SCREEN_WIDTH {
-            // Skip pixels that are before the window's X position
-            // WX-7 is the actual starting X position on the screen
-            let wx_adjusted = if self.wx < 7 { 0 } else { self.wx - 7 };
-            if (x as u8) < wx_adjusted {
-                continue;
+        // Process window pixels
+        for x in win_x_start..SCREEN_WIDTH {
+            // Calculate position within window
+            let win_x = (x - win_x_start) as u8;
+            let tile_col = (win_x / 8) as u16;
+            let tile_x = win_x % 8;
+            
+            // Get tile index from the window map
+            let tile_map_addr = win_tile_map - 0x8000 + ((tile_row as usize) * 32) + (tile_col as usize);
+            if tile_map_addr >= 0x2000 {
+                continue; // Out of bounds
             }
             
-            rendered = true;
+            let tile_idx = self.vram[tile_map_addr];
             
-            // Calculate X position within window
-            let window_x = (x as u8).wrapping_sub(wx_adjusted);
+            // Get tile data address based on LCDC bit 4
+            let tile_data_addr = self.get_tile_data_address(tile_idx);
             
-            // Calculate which tile column we're on
-            let tile_col = (window_x / 8) as u16;
-            
-            // Calculate which pixel column within the tile
-            let tile_x = (window_x % 8) as u16;
-            
-            // Calculate tile index address in the tile map
-            let tile_map_index = tile_map_addr + tile_row * 32 + tile_col;
-            
-            // Get the tile index from the tile map
-            let tile_index = self.read_vram(tile_map_index);
-            
-            // Calculate tile data address
-            let tile_data_index = if !tile_data_signed {
-                tile_data_addr + (tile_index as u16) * 16
-            } else {
-                // $8800 addressing uses signed tile indices
-                tile_data_addr + ((tile_index as i8 as i16 + 128) as u16) * 16
-            };
+            // Get the specific tile row we need
+            let tile_addr = tile_data_addr + (tile_y as u16 * 2);
             
             // Read the two bytes of tile data for this row
-            let tile_data_low = self.read_vram(tile_data_index + tile_y * 2);
-            let tile_data_high = self.read_vram(tile_data_index + tile_y * 2 + 1);
+            let low_byte = self.vram[(tile_addr - 0x8000) as usize];
+            let high_byte = self.vram[(tile_addr - 0x8000 + 1) as usize];
             
-            // Calculate the bit position within the tile data
+            // Get the color bit for this pixel
             let bit_pos = 7 - tile_x;
+            let low_bit = (low_byte >> bit_pos) & 1;
+            let high_bit = (high_byte >> bit_pos) & 1;
+            let color_idx = (high_bit << 1) | low_bit;
             
-            // Get the pixel color (2 bits, one from each byte)
-            let color_bit_low = (tile_data_low >> bit_pos) & 0x01;
-            let color_bit_high = (tile_data_high >> bit_pos) & 0x01;
-            let color_idx = (color_bit_high << 1) | color_bit_low;
-            
-            // Map to real color from the palette
-            let color = self.get_color(color_idx, self.bgp);
-            
-            // Store in the scanline buffer
-            scanline_buffer[x] = (color, color_idx > 0);
-        }
-        
-        // Only increment window line counter if we actually rendered any window pixels
-        if rendered {
-            self.window_line += 1;
-            //self.last_frame_window_active = true;
-        }
-    }*/
-
-    fn render_window(&mut self, scanline_buffer: &mut [(u8, bool)]) {
-        // Should we be checkin wy or wx ?
-        if self.lcdc & 0x20 == 0 || self.wy > 143 || !self.wy_triggered {
-            return;
-        }
-
-        let wx_adj = self.wx.saturating_sub(7);
-        let tile_map_addr = if self.lcdc & 0x40 != 0 { 0x9C00 } else { 0x9800 };
-        let signed_tiles = (self.lcdc & 0x10) == 0;
-
-        let window_y = self.window_line;
-        let tile_row = (window_y / 8) as u16;
-        let tile_y = (window_y % 8) as u16;
-
-        for pixel_x in 0..SCREEN_WIDTH {
-            let wx_start = wx_adj as i16;
-            let x_start = wx_start.clamp(0, 159) as usize;
-            if pixel_x < x_start {
-                continue;
+            // Only draw if within visible area (0-159)
+            if x < SCREEN_WIDTH {
+                self.scanline_data[x] = PixelData {
+                    color_idx,
+                    color: self.get_dmg_color(color_idx, Palette::BGP),
+                    priority: BgOamPrio::BGPrio,
+                };
             }
-
-            let window_x = (pixel_x - x_start) as u16;
-            let tile_col = (window_x / 8) as u16;
-            let tile_x = (window_x % 8) as u16;
-            
-            let tile_map_index = tile_map_addr + tile_row * 32 + tile_col;
-            let tile_index = self.read_vram(tile_map_index);
-            let tile_addr = if signed_tiles {
-                0x9000u16.wrapping_add((tile_index as i8 as i16 * 16) as u16)
-            } else {
-                0x8000u16 + (tile_index as u16 * 16)
-            };
-            
-            let addr = tile_addr + tile_y * 2;
-            let byte1 = self.read_vram(addr);
-            let byte2 = self.read_vram(addr + 1);
-            
-            let bit_index = 7 - tile_x;
-            let color_bit_low = (byte1 >> bit_index) & 0x01;
-            let color_bit_high = (byte2 >> bit_index) & 0x01;
-            let color_idx = (color_bit_high << 1) | color_bit_low;
-            let color = self.get_color(color_idx, self.bgp);
-            
-            scanline_buffer[pixel_x] = (color, color_idx > 0);
         }
-        self.last_frame_window_active = true;
     }
-    
-    // Render the sprites for the current scanline
-    fn render_sprites(&mut self, scanline_buffer: &mut [(u8, bool)]) {
-        // Skip sprite rendering entirely if sprites are disabled
-        if self.lcdc & 0x02 == 0 {
-            return;
-        }
-    
-        // Get sprite size (8x8 or 8x16)
-        let sprite_size = if self.lcdc & 0x04 != 0 { 16 } else { 8 };
+
+    // Render sprites for current scanline
+    fn render_sprites(&mut self) {
+        // Get sprite size from LCDC
+        let sprite_size = if self.is_sprite_8x16() { 16 } else { 8 };
         
-        // Process the sprites that were found during OAM scan
-        // Important: DMG renders sprites from lowest X-coordinate to highest
-        // with OAM index as tie-breaker, so we should process in reverse order
-        // since our prepare_sprites_for_scanline sorts by X and then OAM index
-        for &(_, sprite) in self.scanline_sprites.iter() {
+        // Process sprites from highest to lowest priority (already sorted)
+        for &(_, sprite) in &self.scanline_sprites {
             let sprite_y = sprite.y_pos.wrapping_sub(16);
             let sprite_x = sprite.x_pos.wrapping_sub(8);
             
-            // Skip sprites with X=0 (these count toward the 10 sprite limit but aren't rendered)
+            // Skip sprites with X=0 (they still count toward 10 sprite limit though)
             if sprite.x_pos == 0 {
                 continue;
             }
             
-            // Get sprite attributes
-            let priority = sprite.has_priority(); // OBJ-to-BG Priority (bit 7)
-            let flip_y = sprite.is_y_flipped();
-            let flip_x = sprite.is_x_flipped();
-            let palette = if sprite.palette() == 1 { self.obp1 } else { self.obp0 };
-            
-            // Calculate the correct tile index for the sprite
-            let mut tile_idx = sprite.tile_idx as u16;
-            
-            // For 8x16 sprites, bit 0 of the tile index is ignored
-            if sprite_size == 16 {
-                tile_idx &= 0xFE; // Clear bit 0
+            // Calculate the Y offset within the sprite
+            let mut y_offset = (self.ly as i16 - sprite_y as i16) as u8;
+            if sprite.is_y_flipped() {
+                y_offset = (sprite_size - 1) - y_offset;
             }
             
-            // Calculate the y offset within the sprite
-            let mut y_offset = (self.ly - sprite_y) as u16;
-            if flip_y {
-                y_offset = (sprite_size as u16) - 1 - y_offset;
-            }
+            // Calculate the correct tile index based on sprite size
+            let tile_idx = if sprite_size == 16 {
+                // For 8x16 sprites, bit 0 of tile index is ignored
+                // Upper/lower tile is determined by Y coordinate
+                if y_offset < 8 {
+                    sprite.tile_idx & 0xFE // Upper tile (even)
+                } else {
+                    (sprite.tile_idx & 0xFE) + 1 // Lower tile (odd)
+                }
+            } else {
+                sprite.tile_idx
+            };
             
-            // For 8x16 sprites, determine if we're in the bottom tile
-            if sprite_size == 16 && y_offset >= 8 {
-                tile_idx += 1; // Use next tile for bottom half
-                y_offset -= 8; // Adjust offset for the second tile
-            }
+            // Adjust y_offset for double-height sprites
+            let adjusted_y_offset = y_offset % 8;
             
-            // Calculate the tile data address (sprites always use $8000 addressing mode)
-            let tile_data_addr = 0x8000 + tile_idx * 16 + y_offset * 2;
+            // Calculate tile data address
+            let tile_addr = 0x8000 + (tile_idx as u16 * 16) + (adjusted_y_offset as u16 * 2);
             
-            // Read the two bytes of tile data for this row
-            let tile_data_low = self.read_vram(tile_data_addr);
-            let tile_data_high = self.read_vram(tile_data_addr + 1);
+            // Read tile data for this sprite row
+            let low_byte = self.vram[(tile_addr - 0x8000) as usize];
+            let high_byte = self.vram[(tile_addr - 0x8000 + 1) as usize];
             
-            // For each pixel in the sprite's width
-            for x_offset in 0..8 {
-                // Calculate the screen X position
-                let screen_x = sprite_x.wrapping_add(x_offset);
+            // Get the palette for this sprite
+            let palette = if sprite.palette() == 0 {
+                Palette::OBP0
+            } else {
+                Palette::OBP1
+            };
+            
+            // Process each pixel in the sprite
+            for x in 0..8 {
+                // Apply X flip if needed
+                let bit_pos = if sprite.is_x_flipped() { x } else { 7 - x };
                 
-                // Skip if outside screen bounds
+                // Get color index for this pixel
+                let low_bit = (low_byte >> bit_pos) & 1;
+                let high_bit = (high_byte >> bit_pos) & 1;
+                let sprite_color_idx = (high_bit << 1) | low_bit;
+                
+                // Transparent pixel (color 0) - skip
+                if sprite_color_idx == 0 {
+                    continue;
+                }
+                
+                // Calculate the screen X position for this sprite pixel
+                let screen_x = sprite_x.wrapping_add(x);
+                
+                // Skip if outside the visible screen
                 if screen_x >= SCREEN_WIDTH as u8 {
                     continue;
                 }
                 
-                // Calculate bit position based on flip status
-                let bit_pos = if flip_x { x_offset } else { 7 - x_offset };
+                // Get background pixel information
+                let bg_pixel = &self.scanline_data[screen_x as usize];
                 
-                // Extract color bits from tile data
-                let color_bit_low = (tile_data_low >> bit_pos) & 0x01;
-                let color_bit_high = (tile_data_high >> bit_pos) & 0x01;
-                let color_idx = (color_bit_high << 1) | color_bit_low;
+                // Apply priority rules:
+                // 1. If sprite has priority and BG is color 0, sprite wins
+                // 2. If BG has priority (sprite attr bit 7 is set) and BG is not color 0, BG wins
+                // 3. Otherwise sprite wins
+                let sprite_wins = if sprite.has_priority() {
+                    bg_pixel.color_idx == 0
+                } else {
+                    true
+                };
                 
-                // Color 0 is transparent for sprites - skip this pixel
-                if color_idx == 0 {
-                    continue;
+                if sprite_wins {
+                    // Sprite is visible - update the pixel
+                    self.scanline_data[screen_x as usize] = PixelData {
+                        color_idx: sprite_color_idx,
+                        color: self.get_dmg_color(sprite_color_idx, palette),
+                        priority: BgOamPrio::OAMPrio,
+                    };
                 }
-                
-                // Map to actual color using the appropriate palette
-                let color = self.get_color(color_idx, palette);
-                
-                // Get the background pixel color and priority flag
-                let x = screen_x as usize;
-                let (_, bg_color_nonzero) = scanline_buffer[x];
-                
-                // Priority rules:
-                // 1. If BG color is 0, sprite always shows
-                // 2. Otherwise, if sprite priority bit is 0, sprite shows
-                // 3. Otherwise, if BG is enabled (LCDC.0) and BG pixel is non-zero, BG shows
-                
-                if !bg_color_nonzero || !priority {
-                    // Either BG is color 0 or sprite has priority over BG
-                    scanline_buffer[x] = (color, false);
-                } else if self.lcdc & 0x01 == 0 {
-                    // Background is disabled, so draw sprite regardless of priority
-                    scanline_buffer[x] = (color, false);
-                }
-                // Otherwise, BG has priority, so keep the background pixel
             }
         }
     }
 
-    // Transfer the scanline buffer to the frame buffer with color mapping
-    fn finalize_scanline(&mut self, scanline_buffer: &[(u8, bool)]) {
-        let ly = self.ly as usize;
-        if ly >= SCREEN_HEIGHT {
+    // Draw the current scanline to the frame buffer
+    fn draw_scanline_to_frame_buffer(&mut self) {
+        let y = self.ly as usize;
+        if y >= SCREEN_HEIGHT {
             return; // Safety check
         }
         
         for x in 0..SCREEN_WIDTH {
-            let (color, _) = scanline_buffer[x];
-            let frame_idx = (ly * SCREEN_WIDTH + x) * 4;
+            let pixel = &self.scanline_data[x];
+            let frame_idx = (y * SCREEN_WIDTH + x) * 4;
             
-            // Set RGBA values with a more pleasant green-tinted Game Boy palette
-            match color {
-                0 => { // Lightest (almost white)
-                    self.frame_buffer[frame_idx] = 224;
-                    self.frame_buffer[frame_idx + 1] = 248;
-                    self.frame_buffer[frame_idx + 2] = 208;
-                    self.frame_buffer[frame_idx + 3] = 255;
+            // Convert the color to RGBA
+            match pixel.color {
+                0 => { // White
+                    self.frame_buffer[frame_idx] = 224;     // R
+                    self.frame_buffer[frame_idx + 1] = 248; // G
+                    self.frame_buffer[frame_idx + 2] = 208; // B
+                    self.frame_buffer[frame_idx + 3] = 255; // A
                 },
-                1 => { // Light green
-                    self.frame_buffer[frame_idx] = 136;
-                    self.frame_buffer[frame_idx + 1] = 192;
-                    self.frame_buffer[frame_idx + 2] = 112;
-                    self.frame_buffer[frame_idx + 3] = 255;
+                1 => { // Light Gray
+                    self.frame_buffer[frame_idx] = 136;     // R
+                    self.frame_buffer[frame_idx + 1] = 192; // G
+                    self.frame_buffer[frame_idx + 2] = 112; // B
+                    self.frame_buffer[frame_idx + 3] = 255; // A
                 },
-                2 => { // Dark green
-                    self.frame_buffer[frame_idx] = 52;
-                    self.frame_buffer[frame_idx + 1] = 104;
-                    self.frame_buffer[frame_idx + 2] = 86;
-                    self.frame_buffer[frame_idx + 3] = 255;
+                2 => { // Dark Gray
+                    self.frame_buffer[frame_idx] = 52;      // R
+                    self.frame_buffer[frame_idx + 1] = 104; // G
+                    self.frame_buffer[frame_idx + 2] = 86;  // B
+                    self.frame_buffer[frame_idx + 3] = 255; // A
                 },
-                3 => { // Darkest (almost black)
-                    self.frame_buffer[frame_idx] = 8;
-                    self.frame_buffer[frame_idx + 1] = 24;
-                    self.frame_buffer[frame_idx + 2] = 32;
-                    self.frame_buffer[frame_idx + 3] = 255;
+                3 => { // Black
+                    self.frame_buffer[frame_idx] = 8;       // R
+                    self.frame_buffer[frame_idx + 1] = 24;  // G
+                    self.frame_buffer[frame_idx + 2] = 32;  // B
+                    self.frame_buffer[frame_idx + 3] = 255; // A
                 },
-                _ => unreachable!(),
+                _ => {} // Should not happen
             }
         }
     }
+
+    // Helper function to get the tile data address based on addressing mode
+    pub fn is_frame_ready(&mut self) -> bool {
+        if self.frame_swapped {
+            self.frame_swapped = false;
+            true
+        } else {
+            false
+        }
+    }
+    fn get_tile_data_address(&self, tile_idx: u8) -> u16 {
+        if self.lcdc & 0x10 != 0 {
+            // 8000 addressing mode (unsigned)
+            0x8000 + (tile_idx as u16 * 16)
+        } else {
+            // 8800 addressing mode (signed)
+            if tile_idx < 128 {
+                0x9000 + (tile_idx as u16 * 16)
+            } else {
+                0x8800 + ((tile_idx - 128) as u16 * 16)
+            }
+        }
+    }
+
+    // Get DMG color based on palette and color index
+    fn get_dmg_color(&self, color_idx: u8, palette: Palette) -> u8 {
+        let palette_value = match palette {
+            Palette::BGP => self.bgp,
+            Palette::OBP0 => self.obp0,
+            Palette::OBP1 => self.obp1,
+        };
+        
+        // Extract the color from the palette (2 bits per color)
+        (palette_value >> (color_idx * 2)) & 0x03
+    }
+
+    // Utility functions for PPU state
     
-    // Get a color from a palette
-    fn get_color(&self, color_idx: u8, palette: u8) -> u8 {
-        let idx = 2 * color_idx;
-        let palette_color = (palette >> idx) & 0x03;
-        palette_color
+    pub fn is_lcd_on(&self) -> bool {
+        self.lcdc & 0x80 != 0
+    }
+    
+    pub fn is_window_enabled(&self) -> bool {
+        self.lcdc & 0x20 != 0
+    }
+    
+    pub fn is_obj_enabled(&self) -> bool {
+        self.lcdc & 0x02 != 0
+    }
+    
+    pub fn is_bg_enabled(&self) -> bool {
+        self.lcdc & 0x01 != 0
+    }
+    
+    pub fn is_sprite_8x16(&self) -> bool {
+        self.lcdc & 0x04 != 0
+    }
+    
+    pub fn is_window_visible(&self) -> bool {
+        // Window is visible if WX <= 166 and WY <= LY
+        self.wx <= 166 && self.wy <= self.ly
     }
 }
